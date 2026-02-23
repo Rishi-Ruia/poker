@@ -115,10 +115,6 @@
 
   </div><!-- /lobby-content -->
 
-  <!-- Cards decoration -->
-  <div style="margin-top: 40px; display: flex; gap: 16px; justify-content: center; opacity: 0.3; font-size: 2rem;">
-    ♠ ♥ ♦ ♣
-  </div>
 </div>
 
 <!-- ═══════════ GAME SCREEN ═══════════ -->
@@ -257,16 +253,86 @@
       <button class="modal-close" id="close-rankings">✕</button>
     </div>
     <div class="rankings-list">
-      <div class="rank-item rank-royal"><span class="rank-num">1</span><span class="rank-name">Royal Flush</span><span class="rank-example">A♠ K♠ Q♠ J♠ 10♠</span></div>
-      <div class="rank-item rank-sf"><span class="rank-num">2</span><span class="rank-name">Straight Flush</span><span class="rank-example">9♥ 8♥ 7♥ 6♥ 5♥</span></div>
-      <div class="rank-item rank-4k"><span class="rank-num">3</span><span class="rank-name">Four of a Kind</span><span class="rank-example">A♠ A♥ A♦ A♣ K♠</span></div>
-      <div class="rank-item rank-fh"><span class="rank-num">4</span><span class="rank-name">Full House</span><span class="rank-example">K♠ K♥ K♦ Q♠ Q♥</span></div>
-      <div class="rank-item rank-fl"><span class="rank-num">5</span><span class="rank-name">Flush</span><span class="rank-example">A♠ J♠ 8♠ 5♠ 2♠</span></div>
-      <div class="rank-item rank-st"><span class="rank-num">6</span><span class="rank-name">Straight</span><span class="rank-example">10♠ 9♥ 8♦ 7♣ 6♠</span></div>
-      <div class="rank-item rank-3k"><span class="rank-num">7</span><span class="rank-name">Three of a Kind</span><span class="rank-example">Q♠ Q♥ Q♦ A♠ K♥</span></div>
-      <div class="rank-item rank-2p"><span class="rank-num">8</span><span class="rank-name">Two Pair</span><span class="rank-example">J♠ J♥ 9♦ 9♣ A♠</span></div>
-      <div class="rank-item rank-1p"><span class="rank-num">9</span><span class="rank-name">One Pair</span><span class="rank-example">A♠ A♥ K♦ Q♣ J♠</span></div>
-      <div class="rank-item rank-hc"><span class="rank-num">10</span><span class="rank-name">High Card</span><span class="rank-example">A♠ Q♥ 9♦ 7♣ 2♠</span></div>
+      <div class="rank-item rank-royal">
+        <span class="rank-num">1</span>
+        <div class="rank-info">
+          <span class="rank-name">Royal Flush</span>
+          <span class="rank-desc">A K Q J 10 all of the same suit — the best possible hand</span>
+        </div>
+        <span class="rank-example">A♠ K♠ Q♠ J♠ 10♠</span>
+      </div>
+      <div class="rank-item rank-sf">
+        <span class="rank-num">2</span>
+        <div class="rank-info">
+          <span class="rank-name">Straight Flush</span>
+          <span class="rank-desc">Five consecutive cards all of the same suit</span>
+        </div>
+        <span class="rank-example">9♥ 8♥ 7♥ 6♥ 5♥</span>
+      </div>
+      <div class="rank-item rank-4k">
+        <span class="rank-num">3</span>
+        <div class="rank-info">
+          <span class="rank-name">Four of a Kind</span>
+          <span class="rank-desc">All four cards of the same rank (quads)</span>
+        </div>
+        <span class="rank-example">A♠ A♥ A♦ A♣ K♠</span>
+      </div>
+      <div class="rank-item rank-fh">
+        <span class="rank-num">4</span>
+        <div class="rank-info">
+          <span class="rank-name">Full House</span>
+          <span class="rank-desc">Three of a kind plus a pair in the same hand</span>
+        </div>
+        <span class="rank-example">K♠ K♥ K♦ Q♠ Q♥</span>
+      </div>
+      <div class="rank-item rank-fl">
+        <span class="rank-num">5</span>
+        <div class="rank-info">
+          <span class="rank-name">Flush</span>
+          <span class="rank-desc">Any five cards of the same suit, not in sequence</span>
+        </div>
+        <span class="rank-example">A♠ J♠ 8♠ 5♠ 2♠</span>
+      </div>
+      <div class="rank-item rank-st">
+        <span class="rank-num">6</span>
+        <div class="rank-info">
+          <span class="rank-name">Straight</span>
+          <span class="rank-desc">Five consecutive cards of any suit (A can be high or low)</span>
+        </div>
+        <span class="rank-example">10♠ 9♥ 8♦ 7♣ 6♠</span>
+      </div>
+      <div class="rank-item rank-3k">
+        <span class="rank-num">7</span>
+        <div class="rank-info">
+          <span class="rank-name">Three of a Kind</span>
+          <span class="rank-desc">Three cards of the same rank, two unrelated cards</span>
+        </div>
+        <span class="rank-example">Q♠ Q♥ Q♦ A♠ K♥</span>
+      </div>
+      <div class="rank-item rank-2p">
+        <span class="rank-num">8</span>
+        <div class="rank-info">
+          <span class="rank-name">Two Pair</span>
+          <span class="rank-desc">Two separate pairs of matching cards</span>
+        </div>
+        <span class="rank-example">J♠ J♥ 9♦ 9♣ A♠</span>
+      </div>
+      <div class="rank-item rank-1p">
+        <span class="rank-num">9</span>
+        <div class="rank-info">
+          <span class="rank-name">One Pair</span>
+          <span class="rank-desc">Two cards of the same rank, three unrelated cards</span>
+        </div>
+        <span class="rank-example">A♠ A♥ K♦ Q♣ J♠</span>
+      </div>
+      <div class="rank-item rank-hc">
+        <span class="rank-num">10</span>
+        <div class="rank-info">
+          <span class="rank-name">High Card</span>
+          <span class="rank-desc">No combination — the highest single card in your hand plays</span>
+        </div>
+        <span class="rank-example">A♠ Q♥ 9♦ 7♣ 2♠</span>
+      </div>
     </div>
   </div>
 </div>

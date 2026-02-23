@@ -11,6 +11,8 @@ let gameState = null;
 let allPlayers = [];
 let subscriptions = [];
 let isProcessingAction = false;
+let lastSyncedMyChips = null;
+let isSyncingMyStats = false;
 
 // ─── Init ─────────────────────────────────────────────────────────
 function initSupabase() {
@@ -629,8 +631,8 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
   };
   await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
 
-  // Update lifetime stats
-  await updatePlayerStats(state, winnerIds);
+  // Update lifetime hand counters (net chips are synced live during play)
+  await updatePlayerStats(state, winnerIds, { updateNetChips: false });
 
   // Auto-start next hand after delay
   setTimeout(async () => {
@@ -704,6 +706,7 @@ async function checkRoomExpiry() {
 
 async function expireRoom(reason) {
   if (_expiryInterval) { clearInterval(_expiryInterval); _expiryInterval = null; }
+  await syncMyLiveStats(true);
   await supabaseClient.from('rooms').update({ status: 'finished' }).eq('id', currentRoom.id);
   await logAction(currentRoom.id, 'system', 'Dealer', reason, 0);
   showToast(reason, 'error');
@@ -711,7 +714,8 @@ async function expireRoom(reason) {
 }
 
 // ─── Player Stats (Lifetime Leaderboard) ──────────────────────────
-async function updatePlayerStats(state, winnerIds) {
+async function updatePlayerStats(state, winnerIds, options = {}) {
+  const updateNetChips = options.updateNetChips !== false;
   const contributions = state.player_contributions || {};
   const allHandPlayerIds = Object.keys(contributions).filter(id => contributions[id] > 0 || winnerIds.includes(id));
   if (allHandPlayerIds.length === 0) return;
@@ -737,18 +741,63 @@ async function updatePlayerStats(state, winnerIds) {
     const netDelta = winnings - contribution;
 
     const current = statsMap[playerId] || { net_chips: 0, hands_played: 0, hands_won: 0 };
-    upserts.push({
+    const row = {
       player_id: playerId,
       player_name: nameMap[playerId] || 'Unknown',
-      net_chips: current.net_chips + netDelta,
       hands_played: current.hands_played + 1,
       hands_won: current.hands_won + (isWinner ? 1 : 0),
       last_seen: new Date().toISOString()
-    });
+    };
+
+    if (updateNetChips) {
+      row.net_chips = current.net_chips + netDelta;
+    } else if (statsMap[playerId]) {
+      row.net_chips = current.net_chips;
+    }
+
+    upserts.push(row);
   }
 
   if (upserts.length > 0) {
     await supabaseClient.from('player_stats').upsert(upserts);
+  }
+}
+
+async function syncMyLiveStats(force = false) {
+  if (!supabaseClient || !currentRoom || !myPlayerId || !myPlayer) return;
+  if (isSyncingMyStats) return;
+
+  isSyncingMyStats = true;
+  try {
+    const now = new Date().toISOString();
+    const currentChips = Number(myPlayer.chips || 0);
+
+    if (lastSyncedMyChips === null) {
+      lastSyncedMyChips = currentChips;
+    }
+
+    const delta = currentChips - lastSyncedMyChips;
+    if (!force && delta === 0) return;
+
+    const { data: existing } = await supabaseClient
+      .from('player_stats')
+      .select('player_id, net_chips, hands_played, hands_won')
+      .eq('player_id', myPlayerId)
+      .maybeSingle();
+
+    const nextNet = Number(existing?.net_chips || 0) + delta;
+    await supabaseClient.from('player_stats').upsert({
+      player_id: myPlayerId,
+      player_name: myPlayer.name || 'Unknown',
+      net_chips: nextNet,
+      hands_played: Number(existing?.hands_played || 0),
+      hands_won: Number(existing?.hands_won || 0),
+      last_seen: now
+    });
+
+    lastSyncedMyChips = currentChips;
+  } finally {
+    isSyncingMyStats = false;
   }
 }
 
@@ -868,6 +917,7 @@ async function refreshPlayers() {
   if (data) {
     allPlayers = data;
     myPlayer = data.find(p => p.id === myPlayerId);
+    await syncMyLiveStats();
   }
 }
 
@@ -1613,6 +1663,8 @@ async function enterGame(roomId) {
     currentRoom = data;
   }
 
+  lastSyncedMyChips = null;
+
   showScreen('game-screen');
   document.getElementById('room-code').textContent = roomId;
 
@@ -1705,8 +1757,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Leave button
   document.getElementById('btn-leave')?.addEventListener('click', () => {
     if (confirm('Leave the game?')) {
-      supabaseClient.from('room_players').update({ is_connected: false, status: 'out' }).eq('id', myPlayerId);
-      location.reload();
+      (async () => {
+        await syncMyLiveStats(true);
+        await supabaseClient.from('room_players').update({ is_connected: false, status: 'out' }).eq('id', myPlayerId);
+        location.reload();
+      })();
     }
   });
 

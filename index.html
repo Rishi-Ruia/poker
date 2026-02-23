@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Poker · Texas Hold'em Online</title>
+  <meta name="description" content="Play Texas Hold'em Poker online with friends. Create or join a room and start playing!" />
+  <link rel="stylesheet" href="css/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🃏</text></svg>" />
+</head>
+<body>
+
+<!-- Loading Overlay -->
+<div id="loading-overlay">
+  <div class="loading-spinner"></div>
+  <div class="loading-text">Loading...</div>
+</div>
+
+<!-- Toast Container -->
+<div id="toast-container"></div>
+
+<!-- ═══════════ LOBBY SCREEN ═══════════ -->
+<div id="lobby-screen" class="screen">
+  <div class="lobby-title">♠ Poker ♠</div>
+  <div class="lobby-subtitle">Texas Hold'em · Online Multiplayer</div>
+
+  <div class="lobby-box">
+    <div class="lobby-tabs">
+      <button class="lobby-tab active" data-tab="create">Create Room</button>
+      <button class="lobby-tab" data-tab="join">Join Room</button>
+      <button class="lobby-tab" data-tab="browse">Browse</button>
+    </div>
+
+    <!-- Create Tab -->
+    <div id="tab-create" class="tab-content active">
+      <form id="create-form">
+        <div class="form-group">
+          <label class="form-label">Your Name</label>
+          <input class="form-input" id="create-name" type="text" placeholder="Enter your name" maxlength="20" required autocomplete="off" />
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Small Blind</label>
+            <input class="form-input" id="create-sb" type="number" value="10" min="1" max="1000" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Big Blind</label>
+            <input class="form-input" id="create-bb" type="number" value="20" min="2" max="2000" required />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Starting Chips</label>
+            <input class="form-input" id="create-chips" type="number" value="1000" min="100" max="100000" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Max Players</label>
+            <select class="form-input" id="create-max-players">
+              <option value="2">2 players</option>
+              <option value="3">3 players</option>
+              <option value="4">4 players</option>
+              <option value="5">5 players</option>
+              <option value="6" selected>6 players</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary">Create Room</button>
+      </form>
+    </div>
+
+    <!-- Join Tab -->
+    <div id="tab-join" class="tab-content">
+      <form id="join-form">
+        <div class="form-group">
+          <label class="form-label">Your Name</label>
+          <input class="form-input" id="join-name" type="text" placeholder="Enter your name" maxlength="20" required autocomplete="off" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Room Code</label>
+          <input class="form-input" id="join-room-id" type="text" placeholder="e.g. AB3KP" maxlength="5"
+            style="text-transform:uppercase; letter-spacing: 4px; font-size: 1.2rem; text-align:center" autocomplete="off" />
+        </div>
+        <button type="submit" class="btn btn-primary">Join Room</button>
+      </form>
+    </div>
+
+    <!-- Browse Tab -->
+    <div id="tab-browse" class="tab-content">
+      <div id="rooms-list">
+        <div class="empty-rooms">Loading rooms...</div>
+      </div>
+      <button class="btn btn-secondary" onclick="loadRoomsList()">↻ Refresh</button>
+    </div>
+  </div>
+
+  <!-- Cards decoration -->
+  <div style="margin-top: 40px; display: flex; gap: 16px; justify-content: center; opacity: 0.3; font-size: 2rem;">
+    ♠ ♥ ♦ ♣
+  </div>
+</div>
+
+<!-- ═══════════ GAME SCREEN ═══════════ -->
+<div id="game-screen" class="screen">
+
+  <!-- Header -->
+  <div class="game-header">
+    <div class="header-left">
+      <div class="header-logo">♠ Poker</div>
+      <div class="room-id-display">
+        Room: <span id="room-code">-----</span>
+        <button class="header-btn" id="copy-room-code" style="margin-left:8px; padding:4px 10px; font-size:0.72rem;">Copy</button>
+      </div>
+    </div>
+    <div style="display:flex; align-items:center; gap: 10px;">
+      <div id="phase-badge" class="phase-badge">Waiting</div>
+    </div>
+    <div class="header-right">
+      <button class="header-btn" id="start-game-btn">▶ Start Game</button>
+      <button class="header-btn danger" id="btn-leave">✕ Leave</button>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="game-main">
+
+    <!-- Table Area -->
+    <div class="table-area">
+      <div class="poker-table">
+
+        <!-- Seat Container (absolutely positioned around table) -->
+        <div id="seat-container"></div>
+
+        <!-- Center: pot + community cards -->
+        <div class="table-center">
+          <div class="pot-display">
+            <span class="pot-label">POT</span>
+            <span id="pot-amount">$0</span>
+          </div>
+          <div id="community-cards" class="community-cards">
+            <div class="community-card placeholder"></div>
+            <div class="community-card placeholder"></div>
+            <div class="community-card placeholder"></div>
+            <div class="community-card placeholder"></div>
+            <div class="community-card placeholder"></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="game-sidebar">
+
+      <!-- My hand -->
+      <div class="sidebar-section">
+        <div class="sidebar-title">Your Hand</div>
+        <div id="my-chips-big" class="my-chips-big">$1000</div>
+        <div class="my-chips-label">Chips</div>
+        <div id="my-cards" class="my-cards">
+          <div class="my-card face-down"><div class="card-rank">?</div></div>
+          <div class="my-card face-down"><div class="card-rank">?</div></div>
+        </div>
+        <div id="hand-name" class="hand-name-display"></div>
+      </div>
+
+      <!-- Actions -->
+      <div class="sidebar-section">
+        <div id="game-status-text" class="game-status-text">Waiting for game to start...</div>
+        <div id="action-panel">
+          <div class="action-buttons">
+            <button class="action-btn btn-fold" id="btn-fold">Fold</button>
+            <button class="action-btn btn-check" id="btn-check">Check</button>
+            <button class="action-btn btn-call" id="btn-call" style="display:none">Call</button>
+            <button class="action-btn btn-raise" id="btn-raise">Raise ▲</button>
+            <button class="action-btn btn-allin" id="btn-allin">All-In 💥</button>
+          </div>
+          <div id="raise-controls" class="raise-controls">
+            <input type="number" id="raise-input" class="raise-input" placeholder="Raise to..." min="20" step="10" />
+            <button class="btn-confirm-raise" id="btn-confirm-raise">✓</button>
+          </div>
+          <div class="chip-buttons">
+            <button class="chip-btn chip-size-btn">2x BB</button>
+            <button class="chip-btn chip-size-btn">3x BB</button>
+            <button class="chip-btn chip-size-btn">4x BB</button>
+            <button class="chip-btn" onclick="setRaisePot()">Pot</button>
+            <button class="chip-btn" onclick="setRaiseHalfPot()">½ Pot</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Players list -->
+      <div class="sidebar-section">
+        <div class="sidebar-title">Players</div>
+        <div id="players-list" class="players-list-sidebar"></div>
+      </div>
+
+      <!-- Action log -->
+      <div class="sidebar-section" style="flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden;">
+        <div class="sidebar-title">Action Log</div>
+        <div id="action-log" class="action-log"></div>
+      </div>
+
+    </div><!-- /sidebar -->
+  </div><!-- /game-main -->
+
+</div><!-- /game-screen -->
+
+<!-- ═══════════ WAITING OVERLAY ═══════════ -->
+<div id="waiting-overlay">
+  <div class="waiting-box">
+    <div class="waiting-title">Waiting Room</div>
+    <div class="waiting-subtitle">Share the room code with friends</div>
+    <div class="room-code-display">
+      <div class="room-code-label">Room Code</div>
+      <div class="room-code-value" id="waiting-room-code">-----</div>
+    </div>
+    <div class="waiting-players" id="waiting-players-list"></div>
+    <button class="btn btn-primary" id="waiting-start-btn" style="display:none" disabled>
+      Waiting for players...
+    </button>
+    <div style="margin-top: 12px; color: var(--text-muted); font-size: 0.8rem;">
+      Minimum 2 players required
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ WINNER OVERLAY ═══════════ -->
+<div id="winner-overlay"></div>
+
+<!-- Scripts -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="js/poker.js"></script>
+<script src="js/game.js"></script>
+<script>
+  // Pot-sized raise helper
+  function setRaisePot() {
+    const input = document.getElementById('raise-input');
+    const pot = gameState?.pot || 0;
+    const myBet = gameState?.player_bets?.[myPlayerId] || 0;
+    const call = (gameState?.current_bet || 0) - myBet;
+    if (input) input.value = pot + call + (gameState?.current_bet || 0);
+    document.getElementById('raise-controls')?.classList.add('visible');
+  }
+  function setRaiseHalfPot() {
+    const input = document.getElementById('raise-input');
+    const pot = gameState?.pot || 0;
+    const myBet = gameState?.player_bets?.[myPlayerId] || 0;
+    const call = (gameState?.current_bet || 0) - myBet;
+    if (input) input.value = Math.floor((pot + call) / 2) + (gameState?.current_bet || 0);
+    document.getElementById('raise-controls')?.classList.add('visible');
+  }
+
+  // Sync players in waiting room when realtime fires
+  const _origRefreshPlayers = typeof refreshPlayers !== 'undefined' ? refreshPlayers : null;
+</script>
+</body>
+</html>

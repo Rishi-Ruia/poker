@@ -62,21 +62,40 @@ async function joinRoom(roomId, playerName) {
   // Check room exists
   const { data: room, error } = await supabaseClient.from('rooms').select('*').eq('id', roomId).single();
   if (error || !room) throw new Error('Room not found');
-  if (room.status === 'playing') throw new Error('Game already in progress');
+  if (room.status === 'finished') throw new Error('Game has already ended');
 
   // Check player count
   const { data: players } = await supabaseClient.from('room_players').select('*').eq('room_id', roomId);
-  if (players && players.length >= room.max_players) throw new Error('Room is full');
-
-  // Check if already in room
   const existing = players?.find(p => p.id === myPlayerId);
+
+  if (room.status === 'playing') {
+    // Only allow rejoining if player was previously in this room
+    if (!existing) throw new Error('Game already in progress');
+    if (existing.status === 'out') {
+      // Player left — do a rebuy with a fresh starting stack
+      await supabaseClient.from('room_players').update({
+        name: playerName,
+        chips: room.starting_chips,
+        status: 'waiting',
+        is_connected: true
+      }).eq('id', myPlayerId).eq('room_id', roomId);
+      await logAction(roomId, myPlayerId, playerName, `rejoined with rebuy ($${room.starting_chips})`, room.starting_chips);
+      return { room, isRebuy: true };
+    }
+    // Player is still in the game — reconnect
+    await supabaseClient.from('room_players').update({ name: playerName, is_connected: true }).eq('id', myPlayerId);
+    return { room, isRebuy: false };
+  }
+
+  // Room is waiting
   if (!existing) {
+    if (players && players.length >= room.max_players) throw new Error('Room is full');
     await joinRoomAsPlayer(roomId, playerName, room.starting_chips);
   } else {
-    // Update name
+    // Update name / reconnect
     await supabaseClient.from('room_players').update({ name: playerName, is_connected: true }).eq('id', myPlayerId);
   }
-  return room;
+  return { room, isRebuy: false };
 }
 
 async function joinRoomAsPlayer(roomId, playerName, chips) {
@@ -111,7 +130,7 @@ function generateRoomCode() {
 }
 
 async function fetchRooms() {
-  const { data } = await supabaseClient.from('rooms').select('*, room_players(count)').eq('status', 'waiting').order('created_at', { ascending: false }).limit(20);
+  const { data } = await supabaseClient.from('rooms').select('*, room_players(count)').in('status', ['waiting', 'playing']).order('created_at', { ascending: false }).limit(20);
   return data || [];
 }
 
@@ -488,7 +507,6 @@ async function runOutBoard(state) {
 }
 
 async function doShowdown(state) {
-  // Evaluate hands for all non-folded players
   const nonFolded = state.active_player_ids || [];
   const allIn = state.all_in_players || [];
   const showdownPlayers = [...new Set([...nonFolded, ...allIn])];
@@ -499,16 +517,84 @@ async function doShowdown(state) {
     return;
   }
 
-  const playerHandData = showdownPlayers.map(id => ({
-    id,
-    cards: state.hands[id] || []
-  })).filter(p => p.cards.length === 2);
+  await logAction(currentRoom.id, 'system', 'Dealer', 'Showdown! Players must show or muck.', 0);
+
+  const newState = {
+    ...state,
+    phase: 'showdown',
+    showdown_needed: [...showdownPlayers],
+    showdown_decisions: {},
+    optional_reveals: {}
+  };
+  await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+}
+
+async function playerReveal(show) {
+  if (!gameState || isProcessingAction) return;
+  const needed = gameState.showdown_needed || [];
+  const decisions = gameState.showdown_decisions || {};
+
+  if (!needed.includes(myPlayerId)) {
+    // Optional reveal for folded players
+    const player = allPlayers.find(p => p.id === myPlayerId);
+    if (player?.status !== 'folded') return;
+    const optReveals = { ...(gameState.optional_reveals || {}), [myPlayerId]: show };
+    const newState = { ...gameState, optional_reveals: optReveals };
+    await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+    return;
+  }
+
+  if (decisions[myPlayerId] !== undefined) return;
+
+  isProcessingAction = true;
+  try {
+    const newDecisions = { ...decisions, [myPlayerId]: show };
+    // If this is the last player to decide and they want to muck but everyone else already mucked, force reveal
+    const allOthersMucked = needed.filter(id => id !== myPlayerId).every(id => newDecisions[id] === false);
+    if (allOthersMucked && !show) newDecisions[myPlayerId] = true;
+
+    const newState = { ...gameState, showdown_decisions: newDecisions };
+    const stillUndecided = needed.filter(id => newDecisions[id] === undefined);
+
+    if (stillUndecided.length === 0) {
+      await finalizeShowdown(newState);
+    } else {
+      await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+    }
+  } finally {
+    isProcessingAction = false;
+  }
+}
+
+async function finalizeShowdown(state) {
+  const needed = state.showdown_needed || [];
+  const decisions = state.showdown_decisions || {};
+
+  const revealers = needed.filter(id => decisions[id] === true);
+  const muckers = needed.filter(id => decisions[id] === false);
+
+  for (const id of muckers) {
+    const p = allPlayers.find(pl => pl.id === id);
+    await logAction(currentRoom.id, id, p?.name || id, 'mucks hand', 0);
+  }
+
+  if (revealers.length === 0) {
+    await awardPot(state, needed, false);
+    return;
+  }
+
+  const playerHandData = revealers
+    .map(id => ({ id, cards: state.hands[id] || [] }))
+    .filter(p => p.cards.length === 2);
 
   const { winners, evaluations } = determineWinners(playerHandData, state.community_cards);
 
-  await logAction(currentRoom.id, 'system', 'Dealer', 'Showdown!', 0);
+  for (const ev of evaluations) {
+    const p = allPlayers.find(pl => pl.id === ev.id);
+    await logAction(currentRoom.id, ev.id, p?.name || ev.id, `shows — ${ev.hand?.name || ''}`, 0);
+  }
 
-  const newState = { ...state, phase: 'showdown', winners, evaluations };
+  const newState = { ...state, winners, evaluations, showdown_resolved: true };
   await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
 
   await awardPot(state, winners, true, evaluations);
@@ -543,6 +629,9 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
   };
   await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
 
+  // Update lifetime stats
+  await updatePlayerStats(state, winnerIds);
+
   // Auto-start next hand after delay
   setTimeout(async () => {
     const { data: currentPlayers } = await supabaseClient.from('room_players').select('*').eq('room_id', currentRoom.id);
@@ -576,6 +665,144 @@ function buildPostflopOrder(state) {
 
 async function logAction(roomId, playerId, playerName, action, amount) {
   await supabaseClient.from('game_actions').insert({ room_id: roomId, player_id: playerId, player_name: playerName, action, amount });
+}
+
+// ─── Room Expiry ──────────────────────────────────────────────────
+let _expiryInterval = null;
+
+function startRoomExpiryCheck() {
+  if (_expiryInterval) clearInterval(_expiryInterval);
+  _expiryInterval = setInterval(checkRoomExpiry, 30000);
+}
+
+async function checkRoomExpiry() {
+  if (!currentRoom || !gameState) return;
+
+  const now = Date.now();
+
+  if (currentRoom.status === 'waiting') {
+    // Expire waiting rooms after 10 minutes if only 1 or 0 players
+    const { data: room } = await supabaseClient.from('rooms').select('created_at').eq('id', currentRoom.id).single();
+    if (!room) return;
+    const age = now - new Date(room.created_at).getTime();
+    if (age > 10 * 60 * 1000 && allPlayers.length <= 1) {
+      await expireRoom('Waiting room closed — no players joined within 10 minutes.');
+    }
+    return;
+  }
+
+  if (currentRoom.status === 'playing') {
+    // Expire active rooms after 1 hour of no state changes
+    const { data: gs } = await supabaseClient.from('game_state').select('updated_at').eq('room_id', currentRoom.id).single();
+    if (!gs) return;
+    const idle = now - new Date(gs.updated_at).getTime();
+    if (idle > 60 * 60 * 1000) {
+      await expireRoom('Room closed due to 1 hour of inactivity.');
+    }
+  }
+}
+
+async function expireRoom(reason) {
+  if (_expiryInterval) { clearInterval(_expiryInterval); _expiryInterval = null; }
+  await supabaseClient.from('rooms').update({ status: 'finished' }).eq('id', currentRoom.id);
+  await logAction(currentRoom.id, 'system', 'Dealer', reason, 0);
+  showToast(reason, 'error');
+  setTimeout(() => location.reload(), 4000);
+}
+
+// ─── Player Stats (Lifetime Leaderboard) ──────────────────────────
+async function updatePlayerStats(state, winnerIds) {
+  const contributions = state.player_contributions || {};
+  const allHandPlayerIds = Object.keys(contributions).filter(id => contributions[id] > 0 || winnerIds.includes(id));
+  if (allHandPlayerIds.length === 0) return;
+
+  // Fetch names from current room
+  const { data: roomPlayers } = await supabaseClient.from('room_players').select('id, name').in('id', allHandPlayerIds).eq('room_id', currentRoom.id);
+  const nameMap = {};
+  if (roomPlayers) roomPlayers.forEach(p => nameMap[p.id] = p.name);
+
+  // Fetch existing stats for these players
+  const { data: existingStats } = await supabaseClient.from('player_stats').select('*').in('player_id', allHandPlayerIds);
+  const statsMap = {};
+  if (existingStats) existingStats.forEach(s => statsMap[s.player_id] = s);
+
+  const perWinner = winnerIds.length > 0 ? Math.floor(state.pot / winnerIds.length) : 0;
+  const upserts = [];
+
+  for (let i = 0; i < allHandPlayerIds.length; i++) {
+    const playerId = allHandPlayerIds[i];
+    const contribution = contributions[playerId] || 0;
+    const isWinner = winnerIds.includes(playerId);
+    const winnings = isWinner ? perWinner + (winnerIds.indexOf(playerId) === 0 ? state.pot % winnerIds.length : 0) : 0;
+    const netDelta = winnings - contribution;
+
+    const current = statsMap[playerId] || { net_chips: 0, hands_played: 0, hands_won: 0 };
+    upserts.push({
+      player_id: playerId,
+      player_name: nameMap[playerId] || 'Unknown',
+      net_chips: current.net_chips + netDelta,
+      hands_played: current.hands_played + 1,
+      hands_won: current.hands_won + (isWinner ? 1 : 0),
+      last_seen: new Date().toISOString()
+    });
+  }
+
+  if (upserts.length > 0) {
+    await supabaseClient.from('player_stats').upsert(upserts);
+  }
+}
+
+async function fetchLeaderboard() {
+  const { data } = await supabaseClient.from('player_stats')
+    .select('*')
+    .order('net_chips', { ascending: false })
+    .limit(15);
+  return data || [];
+}
+
+function renderLeaderboard(players) {
+  const list = document.getElementById('leaderboard-list');
+  if (!list) return;
+
+  if (players.length === 0) {
+    list.innerHTML = '<div class="lb-empty">No data yet. Play some hands!</div>';
+    return;
+  }
+
+  const myId = getOrCreatePlayerId();
+  list.innerHTML = players.map((p, i) => {
+    const isMe = p.player_id === myId;
+    const isPositive = p.net_chips >= 0;
+    const winRate = p.hands_played > 0 ? Math.round((p.hands_won / p.hands_played) * 100) : 0;
+    return `
+      <div class="lb-row${isMe ? ' lb-me' : ''}">
+        <div class="lb-rank">${i < 3 ? ['🥇','🥈','🥉'][i] : i + 1}</div>
+        <div class="lb-player">
+          <div class="lb-name">${escHtml(p.player_name)}${isMe ? ' ★' : ''}</div>
+          <div class="lb-meta">${p.hands_played} hands · ${winRate}% win rate</div>
+        </div>
+        <div class="lb-chips ${isPositive ? 'lb-positive' : 'lb-negative'}">
+          ${isPositive ? '+' : ''}${p.net_chips.toLocaleString()}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+let _lbSubscription = null;
+
+async function initLeaderboard() {
+  const players = await fetchLeaderboard();
+  renderLeaderboard(players);
+
+  // Subscribe to realtime updates
+  if (_lbSubscription) supabaseClient.removeChannel(_lbSubscription);
+  _lbSubscription = supabaseClient.channel('player_stats_changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'player_stats' }, async () => {
+      const updated = await fetchLeaderboard();
+      renderLeaderboard(updated);
+    })
+    .subscribe();
 }
 
 // ─── Realtime Subscriptions ───────────────────────────────────────
@@ -644,179 +871,301 @@ async function refreshPlayers() {
   }
 }
 
-// ─── UI Rendering ─────────────────────────────────────────────────
+// ─── UI Rendering (anti-flicker, keyed in-place updates) ──────────
+// Track previously rendered values to skip no-op updates
+let _rnd = 0; // render generation counter
+let _prevCommunityCards = [];
+let _prevMyCards = null;
+let _prevPot = -1;
+let _prevPhase = null;
+let _prevRound = -1;
+let _shownWinner = null;
+
 function renderGame() {
   if (!gameState || !allPlayers.length) return;
+  _rnd++;
 
-  renderTableSeats();
-  renderCommunityCards();
-  renderPot();
-  renderMyHand();
-  renderSidebarPlayers();
+  patchTableSeats();
+  patchCommunityCards();
+  patchPot();
+  patchMyHand();
+  patchSidebarPlayers();
   renderActionPanel();
   renderPhase();
   checkAndShowWinner();
 }
 
-function renderTableSeats() {
-  const seatContainer = document.getElementById('seat-container');
-  if (!seatContainer) return;
-  seatContainer.innerHTML = '';
+// ── Seats: create once per slot, patch content each render ────────
+function patchTableSeats() {
+  const container = document.getElementById('seat-container');
+  if (!container) return;
 
-  const maxSeats = 7;
-  for (let i = 0; i < maxSeats; i++) {
-    const player = allPlayers.find(p => p.seat === i);
-    const div = document.createElement('div');
-    div.className = `player-seat seat-${i}`;
-
-    if (!player) {
-      div.classList.add('empty');
-      div.innerHTML = `
-        <div class="player-avatar">+</div>
-        <div class="player-info" style="opacity:0.3">
-          <div class="player-name">Empty</div>
-        </div>
-      `;
-    } else {
-      const isMe = player.id === myPlayerId;
-      const isTurn = gameState.current_player_id === player.id && gameState.phase !== 'waiting' && gameState.phase !== 'showdown';
-      const isFolded = player.status === 'folded';
-      const isDealer = gameState.dealer_seat === player.seat;
-      const isSB = gameState.small_blind_player_id === player.id;
-      const isBB = gameState.big_blind_player_id === player.id;
-      const currentBet = gameState.player_bets?.[player.id];
-
-      if (isMe) div.classList.add('is-me');
-      if (isTurn) div.classList.add('is-turn');
-      if (isFolded) div.classList.add('folded');
-
-      const avatarEmoji = getPlayerAvatar(player.name);
-      const betDisplay = currentBet > 0 && gameState.phase !== 'waiting' && gameState.phase !== 'showdown'
-        ? `<div class="player-bet-display">$${currentBet}</div>` : '';
-
-      // Show cards for this player (if revealed during showdown, or it's me)
-      let cardsHtml = '';
-      if (gameState.phase !== 'waiting' && gameState.hands) {
-        if (isMe || (gameState.phase === 'showdown' && !isFolded)) {
-          const cards = gameState.hands[player.id];
-          if (cards) {
-            cardsHtml = `<div class="seat-cards">${cards.map(c => renderPocketCard(c, true)).join('')}</div>`;
-          }
-        } else if (!isFolded) {
-          cardsHtml = `<div class="seat-cards">
-            <div class="pocket-card">🂠</div>
-            <div class="pocket-card">🂠</div>
-          </div>`;
-        }
-        if (isFolded) {
-          cardsHtml = `<div class="folded-text">Folded</div>`;
-        }
-      }
-
-      div.innerHTML = `
-        <div class="player-avatar">
-          ${avatarEmoji}
-          ${isDealer ? '<div class="dealer-btn">D</div>' : ''}
-          ${isSB ? '<div class="blind-badge sb-badge">SB</div>' : ''}
-          ${isBB ? '<div class="blind-badge bb-badge">BB</div>' : ''}
-        </div>
-        ${cardsHtml}
-        <div class="player-info">
-          <div class="player-name">${escHtml(player.name)}${isMe ? ' ★' : ''}</div>
-          <div class="player-chips-display">$${player.chips}</div>
-        </div>
-        ${betDisplay}
-      `;
+  for (let i = 0; i < 7; i++) {
+    let el = document.getElementById(`seat-el-${i}`);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = `seat-el-${i}`;
+      el.className = `player-seat seat-${i}`;
+      container.appendChild(el);
     }
-    seatContainer.appendChild(div);
+    patchSeat(el, i);
   }
 }
 
-function renderPocketCard(cardStr, revealed) {
-  if (!revealed) return `<div class="pocket-card">🂠</div>`;
-  const { rank, suit, suitCode } = cardDisplay(cardStr);
-  const isRed = suitCode === 'h' || suitCode === 'd';
-  return `<div class="pocket-card revealed ${isRed ? 'red' : ''}">${rank}${suit}</div>`;
+function patchSeat(el, seatIdx) {
+  const player = allPlayers.find(p => p.seat === seatIdx);
+
+  if (!player) {
+    // Only rebuild if it wasn't already empty
+    if (el.dataset.pid !== '') {
+      el.className = `player-seat seat-${seatIdx} empty`;
+      el.innerHTML = `<div class="player-avatar">+</div><div class="player-info" style="opacity:0.3"><div class="player-name">Empty</div></div>`;
+      el.dataset.pid = '';
+    }
+    return;
+  }
+
+  const isMe = player.id === myPlayerId;
+  const isTurn = gameState.current_player_id === player.id
+    && gameState.phase !== 'waiting' && gameState.phase !== 'showdown';
+  const isFolded = player.status === 'folded';
+  const isAllIn = player.status === 'all_in';
+  const isDealer = gameState.dealer_seat === player.seat;
+  const isSB = gameState.small_blind_player_id === player.id;
+  const isBB = gameState.big_blind_player_id === player.id;
+  const currentBet = gameState.player_bets?.[player.id] || 0;
+
+  // Build a key of everything that could visually change this seat
+  const cardsKey = gameState.phase !== 'waiting' && gameState.hands
+    ? JSON.stringify(gameState.hands[player.id]) + gameState.phase
+    : 'none';
+  const sdDecision = (gameState.showdown_decisions || {})[player.id];
+  const optReveal = (gameState.optional_reveals || {})[player.id];
+  const key = `${player.id}|${player.chips}|${player.status}|${isTurn}|${isDealer}|${isSB}|${isBB}|${currentBet}|${cardsKey}|${sdDecision}|${optReveal}`;
+
+  if (el.dataset.key === key) return; // nothing changed
+  el.dataset.key = key;
+  el.dataset.pid = player.id;
+
+  // Determine CSS classes (toggle, no full teardown)
+  el.className = `player-seat seat-${seatIdx}${isMe ? ' is-me' : ''}${isTurn ? ' is-turn' : ''}${isFolded ? ' folded' : ''}`;
+
+  const avatarEmoji = getPlayerAvatar(player.name);
+  const betHtml = currentBet > 0 && gameState.phase !== 'waiting' && gameState.phase !== 'showdown'
+    ? `<div class="player-bet-display">$${currentBet}</div>` : '';
+
+  let cardsHtml = '';
+  const inGame = gameState.phase !== 'waiting' && gameState.hands;
+  if (inGame) {
+    const decisions = gameState.showdown_decisions || {};
+    const optReveals = gameState.optional_reveals || {};
+    const showFaceUp = isMe ||
+      (gameState.phase === 'showdown' && !isFolded && decisions[player.id] === true) ||
+      (gameState.phase === 'showdown' && isFolded && optReveals[player.id] === true) ||
+      (gameState.round_done && !isFolded && decisions[player.id] === true);
+    const playerCards = gameState.hands[player.id];
+    if (isFolded) {
+      cardsHtml = `<div class="folded-text">Folded</div>`;
+    } else if (showFaceUp && playerCards) {
+      const newHand = !el.dataset.cardsDealt || el.dataset.roundDealt !== String(gameState.round_number);
+      const dealClass = newHand ? ' deal-in' : '';
+      cardsHtml = `<div class="seat-cards">${playerCards.map((c, ci) => pocketCardHtml(c, true, dealClass, ci * 80)).join('')}</div>`;
+      el.dataset.cardsDealt = '1';
+      el.dataset.roundDealt = String(gameState.round_number);
+    } else if (!isFolded) {
+      const newHand = !el.dataset.cardsDealt || el.dataset.roundDealt !== String(gameState.round_number);
+      const dealClass = newHand ? ' deal-in' : '';
+      cardsHtml = `<div class="seat-cards">
+        <div class="pocket-card${dealClass}" style="animation-delay:0ms">🂠</div>
+        <div class="pocket-card${dealClass}" style="animation-delay:80ms">🂠</div>
+      </div>`;
+      el.dataset.cardsDealt = '1';
+      el.dataset.roundDealt = String(gameState.round_number);
+    }
+  }
+
+  const allInBadge = isAllIn ? '<div class="all-in-badge">ALL-IN</div>' : '';
+
+  el.innerHTML = `
+    <div class="player-avatar">
+      ${avatarEmoji}
+      ${isDealer ? '<div class="dealer-btn">D</div>' : ''}
+      ${isSB ? '<div class="blind-badge sb-badge">SB</div>' : ''}
+      ${isBB ? '<div class="blind-badge bb-badge">BB</div>' : ''}
+    </div>
+    ${cardsHtml}
+    <div class="player-info">
+      <div class="player-name">${escHtml(player.name)}${isMe ? ' ★' : ''}</div>
+      <div class="player-chips-display">$${player.chips}</div>
+      ${allInBadge}
+    </div>
+    ${betHtml}
+  `;
 }
 
-function renderCommunityCards() {
+function pocketCardHtml(cardStr, revealed, extraClass = '', delayMs = 0) {
+  if (!revealed) return `<div class="pocket-card${extraClass}" style="animation-delay:${delayMs}ms">🂠</div>`;
+  const { rank, suit, suitCode } = cardDisplay(cardStr);
+  const isRed = suitCode === 'h' || suitCode === 'd';
+  return `<div class="pocket-card revealed ${isRed ? 'red' : ''}${extraClass}" style="animation-delay:${delayMs}ms">${rank}${suit}</div>`;
+}
+
+// ── Community cards: only flip-animate newly added cards ──────────
+function patchCommunityCards() {
   const container = document.getElementById('community-cards');
   if (!container) return;
-  container.innerHTML = '';
 
   const cards = gameState.community_cards || [];
+  const isNewRound = gameState.round_number !== _prevRound;
+  if (isNewRound) {
+    _prevCommunityCards = [];
+    _prevRound = gameState.round_number;
+  }
+
   for (let i = 0; i < 5; i++) {
-    const div = document.createElement('div');
-    if (i < cards.length) {
-      const { rank, suit, suitCode } = cardDisplay(cards[i]);
+    let el = document.getElementById(`cc-${i}`);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = `cc-${i}`;
+      container.appendChild(el);
+    }
+
+    if (i >= cards.length) {
+      if (el.className !== 'community-card placeholder') {
+        el.className = 'community-card placeholder';
+        el.innerHTML = '';
+        _prevCommunityCards[i] = null;
+      }
+      continue;
+    }
+
+    // Card exists — only update if it's newly placed (or round reset)
+    if (_prevCommunityCards[i] === cards[i]) continue;
+    _prevCommunityCards[i] = cards[i];
+
+    const { rank, suit, suitCode } = cardDisplay(cards[i]);
+    const isRed = suitCode === 'h' || suitCode === 'd';
+    el.className = `community-card ${isRed ? 'red' : 'black'} card-flip-in`;
+    el.innerHTML = `
+      <div class="card-rank">${rank}</div>
+      <div class="card-suit">${suit}</div>
+      <div class="card-center-suit">${suit}</div>
+    `;
+    // Remove animation class after it completes so re-renders don't re-trigger it
+    const captured = el;
+    setTimeout(() => captured.classList.remove('card-flip-in'), 600);
+  }
+}
+
+// ── Pot: animate when value changes ──────────────────────────────
+function patchPot() {
+  const el = document.getElementById('pot-amount');
+  if (!el) return;
+  const newPot = gameState.pot || 0;
+  if (newPot !== _prevPot) {
+    if (_prevPot >= 0) {
+      el.classList.remove('pot-bump');
+      void el.offsetWidth; // force reflow to restart animation
+      el.classList.add('pot-bump');
+    }
+    el.textContent = `$${newPot}`;
+    _prevPot = newPot;
+  }
+}
+
+// ── My hand: only re-render when cards change ─────────────────────
+function patchMyHand() {
+  const container = document.getElementById('my-cards');
+  const handName = document.getElementById('hand-name');
+  if (!container) return;
+
+  const cards = gameState.hands?.[myPlayerId] ?? null;
+  const cardsKey = cards ? cards.join(',') : null;
+  const isNewDeal = cardsKey !== _prevMyCards;
+  _prevMyCards = cardsKey;
+
+  if (!cards) {
+    if (isNewDeal) {
+      container.innerHTML = `
+        <div class="my-card face-down"><div class="card-rank">?</div></div>
+        <div class="my-card face-down"><div class="card-rank">?</div></div>
+      `;
+    }
+    if (handName) handName.textContent = '';
+    const chipsEl = document.getElementById('my-chips-big');
+    if (chipsEl && myPlayer) chipsEl.textContent = `$${myPlayer.chips}`;
+    return;
+  }
+
+  if (isNewDeal) {
+    container.innerHTML = '';
+    cards.forEach((cardStr, i) => {
+      const { rank, suit, suitCode } = cardDisplay(cardStr);
       const isRed = suitCode === 'h' || suitCode === 'd';
-      div.className = `community-card ${isRed ? 'red' : 'black'}`;
+      const div = document.createElement('div');
+      div.className = `my-card ${isRed ? 'red' : 'black'} my-card-deal-in`;
+      div.style.animationDelay = `${i * 120}ms`;
       div.innerHTML = `
         <div class="card-rank">${rank}</div>
         <div class="card-suit">${suit}</div>
         <div class="card-center-suit">${suit}</div>
       `;
+      container.appendChild(div);
+      setTimeout(() => div.classList.remove('my-card-deal-in'), 600 + i * 120);
+    });
+  }
+
+  // Hand strength + highlight best-hand cards
+  const community = gameState.community_cards || [];
+  if (handName) {
+    if (community.length >= 3) {
+      const ev = evaluateHand([...cards, ...community]);
+      handName.textContent = ev ? ev.name : '';
     } else {
-      div.className = 'community-card placeholder';
+      handName.textContent = '';
     }
-    container.appendChild(div);
-  }
-}
-
-function renderPot() {
-  const el = document.getElementById('pot-amount');
-  if (el) el.textContent = `$${gameState.pot || 0}`;
-}
-
-function renderMyHand() {
-  const container = document.getElementById('my-cards');
-  const handName = document.getElementById('hand-name');
-  if (!container) return;
-  container.innerHTML = '';
-
-  if (!gameState.hands || !gameState.hands[myPlayerId]) {
-    container.innerHTML = `
-      <div class="my-card face-down"><div class="card-rank">?</div></div>
-      <div class="my-card face-down"><div class="card-rank">?</div></div>
-    `;
-    if (handName) handName.textContent = '';
-    return;
   }
 
-  const cards = gameState.hands[myPlayerId];
-  for (const cardStr of cards) {
-    const { rank, suit, suitCode } = cardDisplay(cardStr);
-    const isRed = suitCode === 'h' || suitCode === 'd';
-    const div = document.createElement('div');
-    div.className = `my-card ${isRed ? 'red' : 'black'}`;
-    div.innerHTML = `
-      <div class="card-rank">${rank}</div>
-      <div class="card-suit">${suit}</div>
-      <div class="card-center-suit">${suit}</div>
-    `;
-    container.appendChild(div);
+  // Apply best-card highlights
+  const highlightSet = community.length >= 3
+    ? new Set(getHighlightCards(cards, community))
+    : new Set();
+  const cardEls = container.querySelectorAll('.my-card');
+  cardEls.forEach((el, i) => {
+    if (cards[i] && highlightSet.has(cards[i])) {
+      el.classList.add('best-card');
+    } else {
+      el.classList.remove('best-card');
+    }
+  });
+
+  // Highlight community cards
+  for (let i = 0; i < 5; i++) {
+    const ccEl = document.getElementById(`cc-${i}`);
+    if (!ccEl) continue;
+    const card = community[i];
+    if (card && highlightSet.has(card)) {
+      ccEl.classList.add('best-card');
+    } else {
+      ccEl.classList.remove('best-card');
+    }
   }
 
-  // Show hand strength if community cards present
-  if (gameState.community_cards?.length >= 3 && handName) {
-    const allCards = [...cards, ...gameState.community_cards];
-    const ev = evaluateHand(allCards);
-    handName.textContent = ev ? ev.name : '';
-  } else if (handName) {
-    handName.textContent = '';
-  }
-
-  // Update my chips
   const chipsEl = document.getElementById('my-chips-big');
   if (chipsEl && myPlayer) chipsEl.textContent = `$${myPlayer.chips}`;
 }
 
-function renderSidebarPlayers() {
+// ── Sidebar players: update rows in-place ─────────────────────────
+function patchSidebarPlayers() {
   const list = document.getElementById('players-list');
   if (!list) return;
-  list.innerHTML = '';
 
-  for (const player of allPlayers) {
+  // Remove rows for players who left
+  list.querySelectorAll('[data-player-row]').forEach(row => {
+    if (!allPlayers.find(p => p.id === row.dataset.playerRow)) row.remove();
+  });
+
+  allPlayers.forEach((player, idx) => {
     const isMe = player.id === myPlayerId;
     const isTurn = gameState.current_player_id === player.id;
     const statusClass = player.status === 'folded' ? 'status-folded'
@@ -826,9 +1175,23 @@ function renderSidebarPlayers() {
       : player.status === 'all_in' ? 'All-in'
       : isTurn ? '● Acting...' : '';
 
-    const div = document.createElement('div');
-    div.className = 'player-row';
-    div.innerHTML = `
+    let row = list.querySelector(`[data-player-row="${player.id}"]`);
+    if (!row) {
+      row = document.createElement('div');
+      row.className = 'player-row';
+      row.dataset.playerRow = player.id;
+      list.appendChild(row);
+    }
+
+    // Move to correct position
+    const rows = [...list.querySelectorAll('[data-player-row]')];
+    if (rows[idx] !== row) list.insertBefore(row, rows[idx] || null);
+
+    const key = `${player.chips}|${player.status}|${isTurn}`;
+    if (row.dataset.key === key) return;
+    row.dataset.key = key;
+
+    row.innerHTML = `
       <div class="player-row-avatar">${getPlayerAvatar(player.name)}</div>
       <div class="player-row-info">
         <div class="player-row-name">${escHtml(player.name)}</div>
@@ -837,8 +1200,7 @@ function renderSidebarPlayers() {
       </div>
       ${isMe ? '<div class="is-you-badge">You</div>' : ''}
     `;
-    list.appendChild(div);
-  }
+  });
 }
 
 function renderActionPanel() {
@@ -849,6 +1211,51 @@ function renderActionPanel() {
   const isMyTurn = gameState.current_player_id === myPlayerId;
   const myStatus = myPlayer?.status;
 
+  // Helper to toggle betting vs showdown buttons
+  const showBtn = document.getElementById('btn-show-hand');
+  const muckBtn = document.getElementById('btn-muck-hand');
+  const foldBtn = document.getElementById('btn-fold');
+  const checkBtn = document.getElementById('btn-check');
+  const callBtn = document.getElementById('btn-call');
+  const raiseBtn = document.getElementById('btn-raise');
+  const allinBtn = document.getElementById('btn-allin');
+  const raiseControls = document.getElementById('raise-controls');
+  const chipBtnsContainer = panel.querySelector('.chip-buttons');
+
+  function showBettingButtons() {
+    if (foldBtn) foldBtn.style.display = '';
+    if (checkBtn) checkBtn.style.display = '';
+    if (raiseBtn) raiseBtn.style.display = '';
+    if (allinBtn) allinBtn.style.display = '';
+    if (showBtn) showBtn.style.display = 'none';
+    if (muckBtn) muckBtn.style.display = 'none';
+    if (chipBtnsContainer) chipBtnsContainer.style.display = '';
+  }
+
+  function showShowdownButtons(showText, muckVisible) {
+    if (foldBtn) foldBtn.style.display = 'none';
+    if (checkBtn) checkBtn.style.display = 'none';
+    if (callBtn) callBtn.style.display = 'none';
+    if (raiseBtn) raiseBtn.style.display = 'none';
+    if (allinBtn) allinBtn.style.display = 'none';
+    if (raiseControls) raiseControls.classList.remove('visible');
+    if (chipBtnsContainer) chipBtnsContainer.style.display = 'none';
+    if (showBtn) { showBtn.style.display = ''; showBtn.textContent = showText; }
+    if (muckBtn) muckBtn.style.display = muckVisible ? '' : 'none';
+  }
+
+  function hideAllButtons() {
+    if (foldBtn) foldBtn.style.display = 'none';
+    if (checkBtn) checkBtn.style.display = 'none';
+    if (callBtn) callBtn.style.display = 'none';
+    if (raiseBtn) raiseBtn.style.display = 'none';
+    if (allinBtn) allinBtn.style.display = 'none';
+    if (showBtn) showBtn.style.display = 'none';
+    if (muckBtn) muckBtn.style.display = 'none';
+    if (raiseControls) raiseControls.classList.remove('visible');
+    if (chipBtnsContainer) chipBtnsContainer.style.display = 'none';
+  }
+
   if (gameState.phase === 'waiting') {
     panel.classList.remove('visible');
     statusText.textContent = 'Waiting for game to start...';
@@ -856,9 +1263,48 @@ function renderActionPanel() {
     return;
   }
 
-  if (gameState.phase === 'showdown' || gameState.round_done) {
+  // Showdown reveal/muck phase — use the main action panel
+  if (gameState.phase === 'showdown' && gameState.showdown_needed && !gameState.round_done) {
+    const needed = gameState.showdown_needed || [];
+    const decisions = gameState.showdown_decisions || {};
+    const myDecision = decisions[myPlayerId];
+    const iAmNeeded = needed.includes(myPlayerId);
+    const isFolded = myStatus === 'folded';
+
+    if (iAmNeeded && myDecision === undefined) {
+      panel.classList.add('visible');
+      showShowdownButtons('Show Hand', true);
+      statusText.textContent = 'Show your hand or muck?';
+      statusText.className = 'game-status-text highlight';
+    } else if (isFolded && !decisions[myPlayerId]) {
+      const optReveals = gameState.optional_reveals || {};
+      if (optReveals[myPlayerId] === undefined) {
+        panel.classList.add('visible');
+        showShowdownButtons('Show Folded Cards', false);
+        statusText.textContent = 'Show your folded cards? (optional)';
+        statusText.className = 'game-status-text';
+      } else {
+        panel.classList.remove('visible');
+        statusText.textContent = 'Waiting for others to decide...';
+        statusText.className = 'game-status-text';
+      }
+    } else if (iAmNeeded && myDecision !== undefined) {
+      panel.classList.remove('visible');
+      const remaining = needed.filter(id => decisions[id] === undefined).length;
+      statusText.textContent = remaining > 0 ? `Waiting for ${remaining} player(s)...` : 'Resolving...';
+      statusText.className = 'game-status-text';
+    } else {
+      panel.classList.remove('visible');
+      const remaining = needed.filter(id => decisions[id] === undefined).length;
+      statusText.textContent = remaining > 0 ? `Showdown: waiting for ${remaining} player(s)` : 'Showdown resolving...';
+      statusText.className = 'game-status-text';
+    }
+    return;
+  }
+
+  if (gameState.round_done) {
     panel.classList.remove('visible');
-    statusText.textContent = 'Showdown! Next hand starting...';
+    statusText.textContent = 'Next hand starting...';
     statusText.className = 'game-status-text highlight';
     return;
   }
@@ -885,8 +1331,9 @@ function renderActionPanel() {
     return;
   }
 
-  // It's my turn
+  // It's my turn — show betting buttons
   panel.classList.add('visible');
+  showBettingButtons();
   statusText.textContent = '';
 
   const myBet = gameState.player_bets?.[myPlayerId] || 0;
@@ -894,8 +1341,6 @@ function renderActionPanel() {
   const toCall = currentBet - myBet;
 
   // Show/hide check vs call
-  const checkBtn = document.getElementById('btn-check');
-  const callBtn = document.getElementById('btn-call');
   if (checkBtn && callBtn) {
     if (toCall === 0) {
       checkBtn.style.display = '';
@@ -932,12 +1377,33 @@ function renderPhase() {
   if (!el || !gameState.phase) return;
   const phaseNames = { waiting: 'Waiting', preflop: 'Pre-Flop', flop: 'Flop', turn: 'Turn', river: 'River', showdown: 'Showdown' };
   el.textContent = phaseNames[gameState.phase] || gameState.phase;
+
+  // Flash banner when phase changes (flop/turn/river/showdown)
+  if (gameState.phase !== _prevPhase && ['flop','turn','river','showdown'].includes(gameState.phase)) {
+    showPhaseBanner(phaseNames[gameState.phase]);
+  }
+  _prevPhase = gameState.phase;
+}
+
+function showPhaseBanner(text) {
+  const existing = document.getElementById('phase-banner');
+  if (existing) existing.remove();
+  const banner = document.createElement('div');
+  banner.id = 'phase-banner';
+  banner.className = 'phase-banner';
+  banner.textContent = text;
+  document.getElementById('table-center-wrap')?.appendChild(banner) ||
+    document.querySelector('.table-center')?.appendChild(banner);
+  setTimeout(() => banner.remove(), 1400);
 }
 
 function checkAndShowWinner() {
-  if (gameState.round_done && gameState.winners?.length) {
-    showWinnerOverlay(gameState.winners, gameState.evaluations, gameState.pot, gameState.community_cards, gameState.hands);
-  }
+  if (!gameState.round_done || !gameState.winners?.length) return;
+  // Only show once per round
+  const winnerKey = `${gameState.round_number}:${gameState.winners.join(',')}`;
+  if (_shownWinner === winnerKey) return;
+  _shownWinner = winnerKey;
+  showWinnerOverlay(gameState.winners, gameState.evaluations, gameState.pot, gameState.community_cards, gameState.hands);
 }
 
 function showWinnerOverlay(winners, evaluations, pot, communityCards, hands) {
@@ -1059,7 +1525,7 @@ function showScreen(id) {
 
 // ─── Main Lobby Logic ─────────────────────────────────────────────
 async function initLobby() {
-  await loadRoomsList();
+  await Promise.all([loadRoomsList(), initLeaderboard()]);
   // Auto-refresh rooms every 5s
   setInterval(loadRoomsList, 5000);
 }
@@ -1072,15 +1538,22 @@ async function loadRoomsList() {
     list.innerHTML = '<div class="empty-rooms">No open rooms. Create one!</div>';
     return;
   }
-  list.innerHTML = rooms.map(r => `
-    <div class="room-card" onclick="quickJoinRoom('${r.id}')">
-      <div class="room-info">
-        <div class="room-name">Room ${r.id}</div>
-        <div class="room-meta">Blinds: $${r.small_blind}/$${r.big_blind} · Chips: $${r.starting_chips}</div>
+  list.innerHTML = rooms.map(r => {
+    const isPlaying = r.status === 'playing';
+    const playerCount = r.room_players?.[0]?.count || 0;
+    return `
+      <div class="room-card${isPlaying ? ' room-playing' : ''}" onclick="quickJoinRoom('${r.id}')">
+        <div class="room-info">
+          <div class="room-name">Room ${r.id}</div>
+          <div class="room-meta">Blinds: $${r.small_blind}/$${r.big_blind} · Chips: $${r.starting_chips}</div>
+        </div>
+        <div class="room-badge-group">
+          ${isPlaying ? '<div class="room-status-badge playing">In Progress</div>' : ''}
+          <div class="room-badge">${playerCount}/${r.max_players}</div>
+        </div>
       </div>
-      <div class="room-badge">${r.room_players?.[0]?.count || 0}/${r.max_players}</div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
 }
 
 function quickJoinRoom(roomId) {
@@ -1123,8 +1596,9 @@ async function handleJoinRoom(e) {
   btn.disabled = true; btn.textContent = 'Joining...';
 
   try {
-    const room = await joinRoom(roomId, name);
+    const { room, isRebuy } = await joinRoom(roomId, name);
     currentRoom = room;
+    if (isRebuy) showToast(`Rebuy! Rejoined with $${room.starting_chips}`, 'success');
     await enterGame(roomId);
   } catch (err) {
     showToast(err.message || 'Failed to join room', 'error');
@@ -1159,6 +1633,7 @@ async function enterGame(roomId) {
     showWaitingOverlay(roomId);
   }
 
+  startRoomExpiryCheck();
   renderGame();
   hideLoading();
 }
@@ -1167,7 +1642,7 @@ async function enterGame(roomId) {
 async function onPlayersChanged() {
   await refreshPlayers();
   updateWaitingPlayers();
-  renderSidebarPlayers();
+  patchSidebarPlayers();
 }
 
 // ─── Bootstrap ────────────────────────────────────────────────────
@@ -1239,5 +1714,20 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('copy-room-code')?.addEventListener('click', () => {
     const code = document.getElementById('room-code')?.textContent;
     if (code) { navigator.clipboard.writeText(code); showToast('Room code copied!'); }
+  });
+
+  // Show/Muck buttons
+  document.getElementById('btn-show-hand')?.addEventListener('click', () => playerReveal(true));
+  document.getElementById('btn-muck-hand')?.addEventListener('click', () => playerReveal(false));
+
+  // Hand rankings modal
+  document.getElementById('btn-rankings')?.addEventListener('click', () => {
+    document.getElementById('rankings-modal')?.classList.add('visible');
+  });
+  document.getElementById('close-rankings')?.addEventListener('click', () => {
+    document.getElementById('rankings-modal')?.classList.remove('visible');
+  });
+  document.getElementById('rankings-modal')?.addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.classList.remove('visible');
   });
 });

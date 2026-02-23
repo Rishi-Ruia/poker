@@ -158,6 +158,63 @@ function cardDisplay(card) {
   return { rank: parsed.rank, suit: suitSymbols[parsed.suit], suitCode: parsed.suit };
 }
 
+// Return the subset of cards from myCards+communityCards that form the best hand.
+// For High Card: returns only the single highest card.
+// For all other hands: returns the cards composing the hand (2-5 cards depending on type).
+function getHighlightCards(myCards, communityCards) {
+  if (!myCards || myCards.length < 2) return [];
+  const allCards = [...myCards, ...communityCards];
+  if (allCards.length < 5) return myCards; // pre-flop: highlight both hole cards
+
+  const result = evaluateHand(allCards);
+  if (!result) return [];
+
+  const bestCards = result.cards; // best 5-card combo
+  const handRank = result.rank;
+
+  if (handRank === 0) {
+    // High Card — highlight only the single highest card in the best hand
+    const sorted = [...bestCards].map(c => ({ c, v: RANK_VALUES[parseCard(c).rank] }))
+      .sort((a, b) => b.v - a.v);
+    return [sorted[0].c];
+  }
+
+  // For pair/two-pair/trips/etc: return only the cards that matter
+  const parsed = bestCards.map(c => ({ c, ...parseCard(c) }));
+  const valueCounts = {};
+  for (const p of parsed) valueCounts[p.value] = (valueCounts[p.value] || 0) + 1;
+
+  switch (handRank) {
+    case 1: { // One Pair — 2 cards
+      const pairVal = Object.entries(valueCounts).find(([, c]) => c === 2)?.[0];
+      return parsed.filter(p => String(p.value) === pairVal).map(p => p.c);
+    }
+    case 2: { // Two Pair — 4 cards
+      const pairVals = Object.entries(valueCounts).filter(([, c]) => c === 2).map(([v]) => v);
+      return parsed.filter(p => pairVals.includes(String(p.value))).map(p => p.c);
+    }
+    case 3: { // Three of a Kind — 3 cards
+      const tripVal = Object.entries(valueCounts).find(([, c]) => c === 3)?.[0];
+      return parsed.filter(p => String(p.value) === tripVal).map(p => p.c);
+    }
+    case 4: // Straight — all 5
+    case 5: // Flush — all 5
+      return bestCards;
+    case 6: { // Full House — all 5
+      return bestCards;
+    }
+    case 7: { // Four of a Kind — 4 cards
+      const quadVal = Object.entries(valueCounts).find(([, c]) => c === 4)?.[0];
+      return parsed.filter(p => String(p.value) === quadVal).map(p => p.c);
+    }
+    case 8: // Straight Flush — all 5
+    case 9: // Royal Flush — all 5
+      return bestCards;
+    default:
+      return bestCards;
+  }
+}
+
 // Get next player seat (active players only)
 function getNextPlayer(seats, currentSeat, activePlayers) {
   const activeSeats = activePlayers.map(p => p.seat).sort((a,b) => a-b);

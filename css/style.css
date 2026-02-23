@@ -351,12 +351,18 @@ body { overflow-y: auto; }
 }
 
 @keyframes pulse-gold {
-  0%, 100% { box-shadow: 0 0 10px rgba(201,162,39,0.5); }
-  50% { box-shadow: 0 0 25px rgba(201,162,39,0.9); }
+  0%, 100% {
+    box-shadow: 0 0 8px rgba(201,162,39,0.5), 0 0 0 0 rgba(201,162,39,0.3);
+  }
+  50% {
+    box-shadow: 0 0 30px rgba(201,162,39,1), 0 0 0 8px rgba(201,162,39,0.1);
+  }
 }
 
 .player-seat.is-me .player-avatar { border-color: #4a9eff; }
-.player-seat.folded .player-avatar { opacity: 0.4; }
+.player-seat.folded { transition: opacity 0.4s; }
+.player-seat.folded .player-avatar { opacity: 0.35; filter: grayscale(0.6); transition: all 0.4s; }
+.player-seat { transition: filter 0.3s; }
 .player-seat.empty .player-avatar {
   border-style: dashed;
   opacity: 0.3;
@@ -387,6 +393,17 @@ body { overflow-y: auto; }
   font-size: 0.7rem;
   color: var(--gold);
   font-weight: 500;
+  transition: color 0.3s;
+}
+
+/* Highlight chips when they change */
+@keyframes chipsChange {
+  0%   { color: #fff; transform: scale(1.2); }
+  100% { color: var(--gold); transform: scale(1); }
+}
+
+.player-chips-display.chips-changed {
+  animation: chipsChange 0.5s ease-out;
 }
 
 .player-bet-display {
@@ -400,6 +417,12 @@ body { overflow-y: auto; }
   font-weight: 600;
   white-space: nowrap;
   pointer-events: none;
+  animation: betPopIn 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes betPopIn {
+  from { transform: scale(0.5); opacity: 0; }
+  to   { transform: scale(1); opacity: 1; }
 }
 
 /* Position bet displays near seats */
@@ -466,6 +489,7 @@ body { overflow-y: auto; }
   align-items: center;
   gap: 14px;
   z-index: 1;
+  position: relative;
 }
 
 .pot-display {
@@ -517,6 +541,54 @@ body { overflow-y: auto; }
 @keyframes dealCard {
   from { transform: scale(0.7) translateY(-20px); opacity: 0; }
   to { transform: scale(1) translateY(0); opacity: 1; }
+}
+
+/* ── 3D flip animation for community cards ── */
+@keyframes cardFlipIn {
+  0%   { transform: perspective(400px) rotateY(90deg) scale(0.8); opacity: 0; }
+  40%  { transform: perspective(400px) rotateY(-10deg) scale(1.05); opacity: 1; }
+  70%  { transform: perspective(400px) rotateY(5deg) scale(1); }
+  100% { transform: perspective(400px) rotateY(0deg) scale(1); opacity: 1; }
+}
+
+.community-card.card-flip-in {
+  animation: cardFlipIn 0.55s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+}
+
+/* ── Pocket card deal animation at seats ── */
+@keyframes pocketDealIn {
+  0%   { transform: translateY(-60px) rotate(-12deg) scale(0.5); opacity: 0; }
+  60%  { transform: translateY(4px) rotate(2deg) scale(1.05); opacity: 1; }
+  80%  { transform: translateY(-2px) rotate(-1deg) scale(1); }
+  100% { transform: translateY(0) rotate(0deg) scale(1); opacity: 1; }
+}
+
+.pocket-card.deal-in {
+  animation: pocketDealIn 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* ── My cards sidebar deal animation ── */
+@keyframes myCardDealIn {
+  0%   { transform: translateY(40px) rotate(8deg) scale(0.6); opacity: 0; }
+  60%  { transform: translateY(-6px) rotate(-2deg) scale(1.08); opacity: 1; }
+  80%  { transform: translateY(3px) rotate(1deg) scale(1); }
+  100% { transform: translateY(0) rotate(0deg) scale(1); opacity: 1; }
+}
+
+.my-card.my-card-deal-in {
+  animation: myCardDealIn 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* ── Pot bump animation ── */
+@keyframes potBump {
+  0%   { transform: scale(1); color: var(--gold); }
+  30%  { transform: scale(1.35); color: var(--gold-light); }
+  60%  { transform: scale(0.95); }
+  100% { transform: scale(1); color: var(--gold); }
+}
+
+.pot-bump {
+  animation: potBump 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 .community-card .card-rank {
@@ -861,6 +933,33 @@ body { overflow-y: auto; }
 .waiting-player-item:last-child { border-bottom: none; }
 .waiting-player-dot { width: 8px; height: 8px; border-radius: 50%; background: #50cc50; flex-shrink: 0; }
 
+/* ─── Phase Banner ─────────────────────────────────────────── */
+.phase-banner {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-family: 'Playfair Display', serif;
+  font-size: clamp(1.8rem, 5vw, 3rem);
+  color: var(--gold);
+  text-shadow: 0 0 30px rgba(201,162,39,0.8), 0 2px 8px rgba(0,0,0,0.9);
+  font-weight: 700;
+  letter-spacing: 6px;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 20;
+  white-space: nowrap;
+  animation: phaseBannerAnim 1.4s ease-out forwards;
+}
+
+@keyframes phaseBannerAnim {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+  20%  { opacity: 1; transform: translate(-50%, -50%) scale(1.15); }
+  50%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  80%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.1); }
+}
+
 /* ─── Winner Overlay ──────────────────────────────────────── */
 #winner-overlay {
   display: none;
@@ -1065,3 +1164,311 @@ body { overflow-y: auto; }
   font-size: 0.65rem;
   font-weight: 700;
 }
+
+/* ─── Lobby Content Layout ───────────────────────────────── */
+.lobby-content {
+  display: flex;
+  flex-direction: row;
+  gap: 24px;
+  align-items: flex-start;
+  justify-content: center;
+  width: 100%;
+  max-width: 900px;
+}
+
+/* ─── Leaderboard Panel ──────────────────────────────────── */
+.leaderboard-panel {
+  background: rgba(0,0,0,0.6);
+  border: 1px solid rgba(201,162,39,0.3);
+  border-radius: 16px;
+  padding: 24px 20px;
+  width: 100%;
+  max-width: 340px;
+  backdrop-filter: blur(10px);
+  flex-shrink: 0;
+}
+
+.lb-header {
+  margin-bottom: 20px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(201,162,39,0.2);
+}
+
+.lb-title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--gold);
+  letter-spacing: 0.5px;
+}
+
+.lb-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.lb-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 10px;
+  border-radius: 8px;
+  margin-bottom: 4px;
+  transition: background 0.15s;
+}
+
+.lb-row:hover {
+  background: rgba(255,255,255,0.04);
+}
+
+.lb-me {
+  background: rgba(201,162,39,0.1);
+  border: 1px solid rgba(201,162,39,0.25);
+}
+
+.lb-rank {
+  font-size: 0.95rem;
+  font-weight: 700;
+  min-width: 28px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.lb-player {
+  flex: 1;
+  min-width: 0;
+}
+
+.lb-name {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text-light);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lb-meta {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.lb-chips {
+  font-size: 0.88rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.lb-positive { color: #50cc80; }
+.lb-negative { color: #cc5050; }
+
+.lb-empty {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 32px 16px;
+  font-size: 0.85rem;
+}
+
+/* ─── Browse Tab Enhancements ────────────────────────────── */
+.room-badge-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.room-status-badge {
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.room-status-badge.playing {
+  background: rgba(80,180,255,0.15);
+  color: #80c8ff;
+  border: 1px solid rgba(80,180,255,0.3);
+}
+
+.room-playing {
+  border-color: rgba(80,180,255,0.25);
+}
+
+.room-playing:hover {
+  border-color: rgba(80,180,255,0.5);
+  background: rgba(80,180,255,0.06);
+}
+
+.browse-legend {
+  display: flex;
+  align-items: center;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+  gap: 6px;
+}
+
+.legend-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.waiting-dot { background: rgba(201,162,39,0.7); }
+.playing-dot { background: rgba(80,180,255,0.7); }
+
+/* ─── Rebuy Hint ─────────────────────────────────────────── */
+.rebuy-hint {
+  background: rgba(80,180,255,0.1);
+  border: 1px solid rgba(80,180,255,0.25);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.8rem;
+  color: #80c8ff;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rebuy-hint-icon {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+/* ─── Responsive: stack panels on small screens ──────────── */
+@media (max-width: 820px) {
+  .lobby-content {
+    flex-direction: column;
+    align-items: center;
+  }
+  .leaderboard-panel {
+    max-width: 440px;
+    width: 100%;
+  }
+}
+
+/* ─── Best Hand Card Highlight ───────────────────────────────── */
+.best-card {
+  box-shadow: 0 0 0 2px var(--gold), 0 0 12px rgba(201,162,39,0.5) !important;
+  z-index: 2;
+  position: relative;
+}
+
+.my-card.best-card {
+  transform: translateY(-6px) scale(1.04);
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+
+/* ─── Show/Muck Buttons ──────────────────────────────────────── */
+.btn-show-hand {
+  background: rgba(50,180,50,0.25);
+  color: #80e080;
+  border: 1px solid rgba(50,180,50,0.5);
+  grid-column: 1/-1;
+}
+.btn-show-hand:hover { background: rgba(50,180,50,0.45); }
+
+.btn-muck-hand {
+  background: rgba(180,50,50,0.25);
+  color: #e08080;
+  border: 1px solid rgba(180,50,50,0.5);
+  grid-column: 1/-1;
+}
+.btn-muck-hand:hover { background: rgba(180,50,50,0.45); }
+
+/* ─── Hand Rankings Modal ─────────────────────────────────────── */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.85);
+  z-index: 500;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(6px);
+}
+.modal-overlay.visible { display: flex; }
+
+.modal-box {
+  background: rgba(10,12,10,0.97);
+  border: 1px solid rgba(201,162,39,0.35);
+  border-radius: 16px;
+  padding: 28px;
+  max-width: 480px;
+  width: 92%;
+  animation: winnerPop 0.3s cubic-bezier(0.34,1.56,0.64,1);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.modal-title {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.3rem;
+  color: var(--gold);
+}
+
+.modal-close {
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.15);
+  color: var(--white);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.2s;
+}
+.modal-close:hover { background: rgba(255,255,255,0.18); }
+
+.rankings-list { display: flex; flex-direction: column; gap: 6px; }
+
+.rank-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border-left: 3px solid transparent;
+  background: rgba(255,255,255,0.04);
+  transition: background 0.15s;
+}
+.rank-item:hover { background: rgba(255,255,255,0.08); }
+
+.rank-num {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  width: 16px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.rank-name {
+  font-size: 0.88rem;
+  font-weight: 600;
+  flex: 1;
+}
+
+.rank-example {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: monospace;
+  letter-spacing: 1px;
+}
+
+/* rank colours */
+.rank-royal { border-left-color: #ffd700; } .rank-royal .rank-name { color: #ffd700; }
+.rank-sf    { border-left-color: #ff8c00; } .rank-sf    .rank-name { color: #ff8c00; }
+.rank-4k    { border-left-color: #cc44ff; } .rank-4k    .rank-name { color: #cc44ff; }
+.rank-fh    { border-left-color: #4488ff; } .rank-fh    .rank-name { color: #4488ff; }
+.rank-fl    { border-left-color: #44ccff; } .rank-fl    .rank-name { color: #44ccff; }
+.rank-st    { border-left-color: #44ff88; } .rank-st    .rank-name { color: #44ff88; }
+.rank-3k    { border-left-color: #88ff44; } .rank-3k    .rank-name { color: #88ff44; }
+.rank-2p    { border-left-color: #ffee44; } .rank-2p    .rank-name { color: #ffee44; }
+.rank-1p    { border-left-color: #ffaa44; } .rank-1p    .rank-name { color: #ffaa44; }
+.rank-hc    { border-left-color: #888;    } .rank-hc    .rank-name { color: #aaa; }

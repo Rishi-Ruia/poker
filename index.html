@@ -24,74 +24,96 @@
   <div class="lobby-title">♠ Poker ♠</div>
   <div class="lobby-subtitle">Texas Hold'em · Online Multiplayer</div>
 
-  <div class="lobby-box">
-    <div class="lobby-tabs">
-      <button class="lobby-tab active" data-tab="create">Create Room</button>
-      <button class="lobby-tab" data-tab="join">Join Room</button>
-      <button class="lobby-tab" data-tab="browse">Browse</button>
-    </div>
+  <div class="lobby-content">
 
-    <!-- Create Tab -->
-    <div id="tab-create" class="tab-content active">
-      <form id="create-form">
-        <div class="form-group">
-          <label class="form-label">Your Name</label>
-          <input class="form-input" id="create-name" type="text" placeholder="Enter your name" maxlength="20" required autocomplete="off" />
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label">Small Blind</label>
-            <input class="form-input" id="create-sb" type="number" value="10" min="1" max="1000" required />
-          </div>
-          <div class="form-group">
-            <label class="form-label">Big Blind</label>
-            <input class="form-input" id="create-bb" type="number" value="20" min="2" max="2000" required />
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label">Starting Chips</label>
-            <input class="form-input" id="create-chips" type="number" value="1000" min="100" max="100000" required />
-          </div>
-          <div class="form-group">
-            <label class="form-label">Max Players</label>
-            <select class="form-input" id="create-max-players">
-              <option value="2">2 players</option>
-              <option value="3">3 players</option>
-              <option value="4">4 players</option>
-              <option value="5">5 players</option>
-              <option value="6" selected>6 players</option>
-            </select>
-          </div>
-        </div>
-        <button type="submit" class="btn btn-primary">Create Room</button>
-      </form>
-    </div>
-
-    <!-- Join Tab -->
-    <div id="tab-join" class="tab-content">
-      <form id="join-form">
-        <div class="form-group">
-          <label class="form-label">Your Name</label>
-          <input class="form-input" id="join-name" type="text" placeholder="Enter your name" maxlength="20" required autocomplete="off" />
-        </div>
-        <div class="form-group">
-          <label class="form-label">Room Code</label>
-          <input class="form-input" id="join-room-id" type="text" placeholder="e.g. AB3KP" maxlength="5"
-            style="text-transform:uppercase; letter-spacing: 4px; font-size: 1.2rem; text-align:center" autocomplete="off" />
-        </div>
-        <button type="submit" class="btn btn-primary">Join Room</button>
-      </form>
-    </div>
-
-    <!-- Browse Tab -->
-    <div id="tab-browse" class="tab-content">
-      <div id="rooms-list">
-        <div class="empty-rooms">Loading rooms...</div>
+    <div class="lobby-box">
+      <div class="lobby-tabs">
+        <button class="lobby-tab active" data-tab="create">Create Room</button>
+        <button class="lobby-tab" data-tab="join">Join Room</button>
+        <button class="lobby-tab" data-tab="browse">Browse</button>
       </div>
-      <button class="btn btn-secondary" onclick="loadRoomsList()">↻ Refresh</button>
+
+      <!-- Create Tab -->
+      <div id="tab-create" class="tab-content active">
+        <form id="create-form">
+          <div class="form-group">
+            <label class="form-label">Your Name</label>
+            <input class="form-input" id="create-name" type="text" placeholder="Enter your name" maxlength="20" required autocomplete="off" />
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">Small Blind</label>
+              <input class="form-input" id="create-sb" type="number" value="10" min="1" max="1000" required />
+            </div>
+            <div class="form-group">
+              <label class="form-label">Big Blind</label>
+              <input class="form-input" id="create-bb" type="number" value="20" min="2" max="2000" required />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">Starting Chips</label>
+              <input class="form-input" id="create-chips" type="number" value="1000" min="100" max="100000" required />
+            </div>
+            <div class="form-group">
+              <label class="form-label">Max Players</label>
+              <select class="form-input" id="create-max-players">
+                <option value="2">2 players</option>
+                <option value="3">3 players</option>
+                <option value="4">4 players</option>
+                <option value="5">5 players</option>
+                <option value="6" selected>6 players</option>
+              </select>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary">Create Room</button>
+        </form>
+      </div>
+
+      <!-- Join Tab -->
+      <div id="tab-join" class="tab-content">
+        <form id="join-form">
+          <div class="form-group">
+            <label class="form-label">Your Name</label>
+            <input class="form-input" id="join-name" type="text" placeholder="Enter your name" maxlength="20" required autocomplete="off" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Room Code</label>
+            <input class="form-input" id="join-room-id" type="text" placeholder="e.g. AB3KP" maxlength="5"
+              style="text-transform:uppercase; letter-spacing: 4px; font-size: 1.2rem; text-align:center" autocomplete="off" />
+          </div>
+          <div class="rebuy-hint" id="rebuy-hint">
+            <span class="rebuy-hint-icon">↺</span> You can rejoin a game in progress with a fresh rebuy stack.
+          </div>
+          <button type="submit" class="btn btn-primary">Join Room</button>
+        </form>
+      </div>
+
+      <!-- Browse Tab -->
+      <div id="tab-browse" class="tab-content">
+        <div class="browse-legend">
+          <span class="legend-dot waiting-dot"></span>Waiting
+          <span class="legend-dot playing-dot" style="margin-left:12px"></span>In Progress (rejoin available)
+        </div>
+        <div id="rooms-list">
+          <div class="empty-rooms">Loading rooms...</div>
+        </div>
+        <button class="btn btn-secondary" onclick="loadRoomsList()">↻ Refresh</button>
+      </div>
     </div>
-  </div>
+
+    <!-- Leaderboard Panel -->
+    <div class="leaderboard-panel">
+      <div class="lb-header">
+        <div class="lb-title">🏆 All-Time Leaderboard</div>
+        <div class="lb-subtitle">Cumulative chip profit/loss</div>
+      </div>
+      <div id="leaderboard-list">
+        <div class="lb-empty">Loading...</div>
+      </div>
+    </div>
+
+  </div><!-- /lobby-content -->
 
   <!-- Cards decoration -->
   <div style="margin-top: 40px; display: flex; gap: 16px; justify-content: center; opacity: 0.3; font-size: 2rem;">
@@ -113,6 +135,7 @@
     </div>
     <div style="display:flex; align-items:center; gap: 10px;">
       <div id="phase-badge" class="phase-badge">Waiting</div>
+      <button class="header-btn" id="btn-rankings" title="Hand rankings">♠ Rankings</button>
     </div>
     <div class="header-right">
       <button class="header-btn" id="start-game-btn">▶ Start Game</button>
@@ -173,6 +196,8 @@
             <button class="action-btn btn-call" id="btn-call" style="display:none">Call</button>
             <button class="action-btn btn-raise" id="btn-raise">Raise ▲</button>
             <button class="action-btn btn-allin" id="btn-allin">All-In 💥</button>
+            <button class="action-btn btn-show-hand" id="btn-show-hand" style="display:none">Show Hand</button>
+            <button class="action-btn btn-muck-hand" id="btn-muck-hand" style="display:none">Muck</button>
           </div>
           <div id="raise-controls" class="raise-controls">
             <input type="number" id="raise-input" class="raise-input" placeholder="Raise to..." min="20" step="10" />
@@ -220,6 +245,28 @@
     </button>
     <div style="margin-top: 12px; color: var(--text-muted); font-size: 0.8rem;">
       Minimum 2 players required
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ HAND RANKINGS MODAL ═══════════ -->
+<div id="rankings-modal" class="modal-overlay">
+  <div class="modal-box rankings-box">
+    <div class="modal-header">
+      <div class="modal-title">Hand Rankings</div>
+      <button class="modal-close" id="close-rankings">✕</button>
+    </div>
+    <div class="rankings-list">
+      <div class="rank-item rank-royal"><span class="rank-num">1</span><span class="rank-name">Royal Flush</span><span class="rank-example">A♠ K♠ Q♠ J♠ 10♠</span></div>
+      <div class="rank-item rank-sf"><span class="rank-num">2</span><span class="rank-name">Straight Flush</span><span class="rank-example">9♥ 8♥ 7♥ 6♥ 5♥</span></div>
+      <div class="rank-item rank-4k"><span class="rank-num">3</span><span class="rank-name">Four of a Kind</span><span class="rank-example">A♠ A♥ A♦ A♣ K♠</span></div>
+      <div class="rank-item rank-fh"><span class="rank-num">4</span><span class="rank-name">Full House</span><span class="rank-example">K♠ K♥ K♦ Q♠ Q♥</span></div>
+      <div class="rank-item rank-fl"><span class="rank-num">5</span><span class="rank-name">Flush</span><span class="rank-example">A♠ J♠ 8♠ 5♠ 2♠</span></div>
+      <div class="rank-item rank-st"><span class="rank-num">6</span><span class="rank-name">Straight</span><span class="rank-example">10♠ 9♥ 8♦ 7♣ 6♠</span></div>
+      <div class="rank-item rank-3k"><span class="rank-num">7</span><span class="rank-name">Three of a Kind</span><span class="rank-example">Q♠ Q♥ Q♦ A♠ K♥</span></div>
+      <div class="rank-item rank-2p"><span class="rank-num">8</span><span class="rank-name">Two Pair</span><span class="rank-example">J♠ J♥ 9♦ 9♣ A♠</span></div>
+      <div class="rank-item rank-1p"><span class="rank-num">9</span><span class="rank-name">One Pair</span><span class="rank-example">A♠ A♥ K♦ Q♣ J♠</span></div>
+      <div class="rank-item rank-hc"><span class="rank-num">10</span><span class="rank-name">High Card</span><span class="rank-example">A♠ Q♥ 9♦ 7♣ 2♠</span></div>
     </div>
   </div>
 </div>

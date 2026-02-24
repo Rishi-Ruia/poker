@@ -1106,7 +1106,7 @@ body { overflow-y: auto; }
     overflow-y: auto;
   }
 
-  .seat-2, .seat-5 { display: none; }
+  .seat-2.empty, .seat-5.empty { display: none; }
   .lobby-box { padding: 24px 20px; }
 }
 

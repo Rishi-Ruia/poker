@@ -257,13 +257,23 @@ function buildPreflopActingOrder(players, bbIndex) {
   return order;
 }
 
+function sortPlayerIdsBySeat(ids) {
+  const seatById = new Map(allPlayers.map(p => [p.id, p.seat]));
+  return [...ids].sort((a, b) => {
+    const aSeat = seatById.has(a) ? seatById.get(a) : Number.MAX_SAFE_INTEGER;
+    const bSeat = seatById.has(b) ? seatById.get(b) : Number.MAX_SAFE_INTEGER;
+    if (aSeat !== bSeat) return aSeat - bSeat;
+    return String(a).localeCompare(String(b));
+  });
+}
+
 function buildReopenedActingOrder(state, actingPlayerId) {
   const eligible = (state.active_player_ids || []).filter(id => id !== actingPlayerId);
   if (!eligible.length) return [];
 
   const seatById = new Map(allPlayers.map(p => [p.id, p.seat]));
   const actorSeat = seatById.get(actingPlayerId);
-  const sorted = [...eligible].sort((a, b) => (seatById.get(a) ?? 999) - (seatById.get(b) ?? 999));
+  const sorted = sortPlayerIdsBySeat(eligible);
   if (actorSeat === undefined) return sorted;
 
   const splitIdx = sorted.findIndex(id => (seatById.get(id) ?? 999) > actorSeat);
@@ -275,6 +285,7 @@ function buildReopenedActingOrder(state, actingPlayerId) {
 // ─── Player Actions ───────────────────────────────────────────────
 async function playerAction(action, amount = 0) {
   if (isProcessingAction) return;
+  if (!gameState || gameState.phase === 'waiting' || gameState.phase === 'showdown') return;
   if (!gameState || gameState.current_player_id !== myPlayerId) {
     showToast("It's not your turn", 'error');
     return;
@@ -503,10 +514,7 @@ async function doShowdown(state) {
   const nonFolded = state.active_player_ids || [];
   const allIn = state.all_in_players || [];
   const showdownSet = new Set([...nonFolded, ...allIn]);
-  const showdownPlayers = allPlayers
-    .filter(p => showdownSet.has(p.id))
-    .sort((a, b) => a.seat - b.seat)
-    .map(p => p.id);
+  const showdownPlayers = sortPlayerIdsBySeat([...showdownSet]);
 
   if (showdownPlayers.length === 0) return;
   if (showdownPlayers.length === 1) {
@@ -657,11 +665,13 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
 
 function buildPostflopOrder(state) {
   // Post-flop order: start from first active player after dealer
-  // Use state.active_player_ids to avoid stale allPlayers status
   const activeIds = state.active_player_ids || [];
-  const activePlayers = allPlayers.filter(p => activeIds.includes(p.id)).sort((a, b) => a.seat - b.seat);
+  if (activeIds.length === 0) return [];
+
+  const seatById = new Map(allPlayers.map(p => [p.id, p.seat]));
+  const activePlayers = sortPlayerIdsBySeat(activeIds).map(id => ({ id, seat: seatById.get(id) }));
   const dealerSeat = state.dealer_seat;
-  const afterDealer = activePlayers.findIndex(p => p.seat > dealerSeat);
+  const afterDealer = activePlayers.findIndex(p => p.seat !== undefined && p.seat > dealerSeat);
   const ordered = afterDealer >= 0
     ? [...activePlayers.slice(afterDealer), ...activePlayers.slice(0, afterDealer)]
     : activePlayers;
@@ -814,9 +824,6 @@ async function syncMyLiveStats(force = false) {
         .maybeSingle();
       if (byName) {
         existing = byName;
-        // Normalize: adopt the canonical player_id so future lookups hit by-id path
-        myPlayerId = byName.player_id;
-        localStorage.setItem('poker_player_id', myPlayerId);
       }
     }
 

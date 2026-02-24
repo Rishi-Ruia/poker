@@ -725,10 +725,21 @@ async function updatePlayerStats(state, winnerIds, options = {}) {
   const nameMap = {};
   if (roomPlayers) roomPlayers.forEach(p => nameMap[p.id] = p.name);
 
-  // Fetch existing stats for these players
+  // Fetch existing stats by player_id
   const { data: existingStats } = await supabaseClient.from('player_stats').select('*').in('player_id', allHandPlayerIds);
   const statsMap = {};
   if (existingStats) existingStats.forEach(s => statsMap[s.player_id] = s);
+
+  // For players whose stats weren't found by ID, try a case-insensitive name lookup
+  const missingIds = allHandPlayerIds.filter(id => !statsMap[id] && nameMap[id]);
+  for (const pid of missingIds) {
+    const { data: byName } = await supabaseClient
+      .from('player_stats')
+      .select('*')
+      .ilike('player_name', nameMap[pid])
+      .maybeSingle();
+    if (byName) statsMap[pid] = byName; // key by original room player_id for lookup below
+  }
 
   const perWinner = winnerIds.length > 0 ? Math.floor(state.pot / winnerIds.length) : 0;
   const upserts = [];
@@ -741,8 +752,10 @@ async function updatePlayerStats(state, winnerIds, options = {}) {
     const netDelta = winnings - contribution;
 
     const current = statsMap[playerId] || { net_chips: 0, hands_played: 0, hands_won: 0 };
+    // Use the canonical player_id from the matched stats row (handles name-based merges)
+    const canonicalId = current.player_id || playerId;
     const row = {
-      player_id: playerId,
+      player_id: canonicalId,
       player_name: nameMap[playerId] || 'Unknown',
       hands_played: current.hands_played + 1,
       hands_won: current.hands_won + (isWinner ? 1 : 0),
@@ -779,15 +792,35 @@ async function syncMyLiveStats(force = false) {
     const delta = currentChips - lastSyncedMyChips;
     if (!force && delta === 0) return;
 
-    const { data: existing } = await supabaseClient
+    // Look up by player_id first; if missing, fall back to case-insensitive name match
+    // so the same person playing from two different browsers merges into one row.
+    let existing = null;
+    const { data: byId } = await supabaseClient
       .from('player_stats')
       .select('player_id, net_chips, hands_played, hands_won')
       .eq('player_id', myPlayerId)
       .maybeSingle();
 
+    if (byId) {
+      existing = byId;
+    } else if (myPlayer.name) {
+      const { data: byName } = await supabaseClient
+        .from('player_stats')
+        .select('player_id, net_chips, hands_played, hands_won')
+        .ilike('player_name', myPlayer.name)
+        .maybeSingle();
+      if (byName) {
+        existing = byName;
+        // Normalize: adopt the canonical player_id so future lookups hit by-id path
+        myPlayerId = byName.player_id;
+        localStorage.setItem('poker_player_id', myPlayerId);
+      }
+    }
+
+    const canonicalId = existing?.player_id || myPlayerId;
     const nextNet = Number(existing?.net_chips || 0) + delta;
     await supabaseClient.from('player_stats').upsert({
-      player_id: myPlayerId,
+      player_id: canonicalId,
       player_name: myPlayer.name || 'Unknown',
       net_chips: nextNet,
       hands_played: Number(existing?.hands_played || 0),
@@ -1575,9 +1608,79 @@ function showScreen(id) {
 
 // ─── Main Lobby Logic ─────────────────────────────────────────────
 async function initLobby() {
-  await Promise.all([loadRoomsList(), initLeaderboard()]);
-  // Auto-refresh rooms every 5s
+  await Promise.all([loadRoomsList(), initLeaderboard(), cleanupStaleRooms()]);
+  // Auto-refresh rooms every 5s; sweep stale rooms every 2 minutes
   setInterval(loadRoomsList, 5000);
+  setInterval(cleanupStaleRooms, 2 * 60 * 1000);
+}
+
+// Sweep rooms that are stuck in waiting/playing states with no activity.
+// This runs on every lobby visit so stale rooms get cleared even when no
+// player is actively inside them.
+async function cleanupStaleRooms() {
+  try {
+    const now = Date.now();
+
+    // ── Waiting rooms ──────────────────────────────────────────────
+    // Close any waiting room that has been open longer than 30 minutes,
+    // or longer than 5 minutes if it has zero connected players.
+    const { data: waitingRooms } = await supabaseClient
+      .from('rooms')
+      .select('id, created_at')
+      .eq('status', 'waiting')
+      .lt('created_at', new Date(now - 5 * 60 * 1000).toISOString()); // skip rooms < 5 min old
+
+    if (waitingRooms?.length) {
+      for (const room of waitingRooms) {
+        const age = now - new Date(room.created_at).getTime();
+
+        // Count players that are still connected/waiting (not 'out')
+        const { data: activePlayers } = await supabaseClient
+          .from('room_players')
+          .select('id')
+          .eq('room_id', room.id)
+          .neq('status', 'out')
+          .eq('is_connected', true);
+
+        const connected = activePlayers?.length || 0;
+
+        const shouldClose =
+          (connected === 0 && age > 5 * 60 * 1000) ||   // empty for 5 min
+          (connected <= 1 && age > 15 * 60 * 1000) ||   // 1 player for 15 min
+          age > 30 * 60 * 1000;                          // anyone for 30 min
+
+        if (shouldClose) {
+          await supabaseClient.from('rooms').update({ status: 'finished' }).eq('id', room.id);
+        }
+      }
+    }
+
+    // ── Playing rooms ──────────────────────────────────────────────
+    // Close any playing room where the game_state hasn't been touched
+    // for more than 1 hour.
+    const { data: playingRooms } = await supabaseClient
+      .from('rooms')
+      .select('id')
+      .eq('status', 'playing');
+
+    if (playingRooms?.length) {
+      const roomIds = playingRooms.map(r => r.id);
+      const { data: gameStates } = await supabaseClient
+        .from('game_state')
+        .select('room_id, updated_at')
+        .in('room_id', roomIds);
+
+      const stalePlayingIds = (gameStates || [])
+        .filter(gs => now - new Date(gs.updated_at).getTime() > 60 * 60 * 1000)
+        .map(gs => gs.room_id);
+
+      if (stalePlayingIds.length) {
+        await supabaseClient.from('rooms').update({ status: 'finished' }).in('id', stalePlayingIds);
+      }
+    }
+  } catch (e) {
+    // Non-critical — silently ignore cleanup errors
+  }
 }
 
 async function loadRoomsList() {
@@ -1670,6 +1773,12 @@ async function enterGame(roomId) {
 
   // Fetch initial data
   await refreshPlayers();
+
+  // Save session so we can auto-reconnect on page reload / DC
+  if (myPlayer?.name) {
+    localStorage.setItem('poker_last_room', roomId);
+    localStorage.setItem('poker_last_name', myPlayer.name);
+  }
   const { data: gsData } = await supabaseClient.from('game_state').select('*').eq('room_id', roomId).single();
   if (gsData) gameState = gsData.state;
 
@@ -1697,6 +1806,35 @@ async function onPlayersChanged() {
   patchSidebarPlayers();
 }
 
+// ─── Auto-Reconnect ───────────────────────────────────────────────
+async function tryAutoReconnect() {
+  const lastRoom = localStorage.getItem('poker_last_room');
+  const lastName = localStorage.getItem('poker_last_name');
+  if (!lastRoom || !lastName) return false;
+
+  try {
+    myPlayerId = getOrCreatePlayerId();
+    const { data: room } = await supabaseClient.from('rooms').select('*').eq('id', lastRoom).single();
+    const { data: player } = await supabaseClient.from('room_players').select('*')
+      .eq('id', myPlayerId).eq('room_id', lastRoom).maybeSingle();
+
+    if (room && room.status !== 'finished' && player && player.status !== 'out') {
+      currentRoom = room;
+      await supabaseClient.from('room_players').update({ is_connected: true })
+        .eq('id', myPlayerId).eq('room_id', lastRoom);
+      showToast('Reconnecting to game...', 'success');
+      await enterGame(lastRoom);
+      return true;
+    }
+  } catch (e) {
+    // Could not reconnect — fall through to lobby
+  }
+
+  localStorage.removeItem('poker_last_room');
+  localStorage.removeItem('poker_last_name');
+  return false;
+}
+
 // ─── Bootstrap ────────────────────────────────────────────────────
 function hideLoading() {
   const overlay = document.getElementById('loading-overlay');
@@ -1705,9 +1843,14 @@ function hideLoading() {
 
 window.addEventListener('DOMContentLoaded', async () => {
   initSupabase();
-  showScreen('lobby-screen');
-  await initLobby();
-  hideLoading();
+
+  // Try to silently reconnect to an in-progress game before showing the lobby
+  const didReconnect = await tryAutoReconnect();
+  if (!didReconnect) {
+    showScreen('lobby-screen');
+    await initLobby();
+    hideLoading();
+  }
 
   // Tab switching
   document.querySelectorAll('.lobby-tab').forEach(tab => {
@@ -1760,6 +1903,8 @@ window.addEventListener('DOMContentLoaded', async () => {
       (async () => {
         await syncMyLiveStats(true);
         await supabaseClient.from('room_players').update({ is_connected: false, status: 'out' }).eq('id', myPlayerId);
+        localStorage.removeItem('poker_last_room');
+        localStorage.removeItem('poker_last_name');
         location.reload();
       })();
     }

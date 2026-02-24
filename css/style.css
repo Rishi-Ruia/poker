@@ -224,6 +224,7 @@ body { overflow-y: auto; }
 #game-screen {
   width: 100vw;
   height: 100vh;
+  height: 100dvh;
   background: #050a05;
   flex-direction: column;
   overflow: hidden;
@@ -267,6 +268,7 @@ body { overflow-y: auto; }
   display: flex;
   overflow: hidden;
   position: relative;
+  min-height: 0;
 }
 
 /* Poker Table */
@@ -276,15 +278,16 @@ body { overflow-y: auto; }
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 20px;
+  padding: 80px 100px;
   position: relative;
+  min-width: 0;
 }
 
 .poker-table {
   width: 100%;
   max-width: 900px;
   aspect-ratio: 2 / 1;
-  max-height: calc(100vh - 220px);
+  max-height: calc(100vh - 340px);
   background: var(--felt-gradient);
   border-radius: 50%;
   border: 12px solid #3d2d0a;
@@ -624,6 +627,8 @@ body { overflow-y: auto; }
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .sidebar-section {
@@ -1072,17 +1077,61 @@ body { overflow-y: auto; }
 .loading-text { color: var(--text-muted); font-size: 0.9rem; }
 
 /* ─── Responsive ──────────────────────────────────────────── */
+
+/* Tablet / small desktop: stack game main vertically, show sidebar below table */
 @media (max-width: 768px) {
-  .game-sidebar { display: none; }
-  .poker-table { aspect-ratio: 1.4 / 1; }
-  .lobby-box { padding: 24px 20px; }
+  .game-main {
+    flex-direction: column;
+  }
+
+  .table-area {
+    flex: 1;
+    min-height: 0;
+    padding: 75px 30px;
+  }
+
+  .poker-table {
+    aspect-ratio: 1.4 / 1;
+    max-height: none;
+    width: 100%;
+  }
+
+  .game-sidebar {
+    display: flex;
+    width: 100%;
+    border-left: none;
+    border-top: var(--border-gold);
+    flex: 0 0 auto;
+    max-height: 45vh;
+    overflow-y: auto;
+  }
+
   .seat-2, .seat-5 { display: none; }
+  .lobby-box { padding: 24px 20px; }
 }
 
+/* Mobile phones */
 @media (max-width: 480px) {
   .lobby-title { font-size: 2.5rem; }
   .community-card { width: 42px; height: 60px; }
   .my-card { width: 52px; height: 74px; }
+
+  /* Compact header */
+  .game-header {
+    flex-wrap: wrap;
+    padding: 6px 10px;
+    gap: 6px;
+  }
+
+  .header-logo { font-size: 1rem; }
+  .room-id-display { font-size: 0.72rem; }
+  .header-btn { font-size: 0.72rem; padding: 5px 10px; }
+
+  /* More space for table on very small screens */
+  .table-area { padding: 70px 16px; }
+
+  /* Slightly more sidebar room on phone */
+  .game-sidebar { max-height: 48vh; }
 }
 
 /* Scrollbars */

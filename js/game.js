@@ -257,6 +257,21 @@ function buildPreflopActingOrder(players, bbIndex) {
   return order;
 }
 
+function buildReopenedActingOrder(state, actingPlayerId) {
+  const eligible = (state.active_player_ids || []).filter(id => id !== actingPlayerId);
+  if (!eligible.length) return [];
+
+  const seatById = new Map(allPlayers.map(p => [p.id, p.seat]));
+  const actorSeat = seatById.get(actingPlayerId);
+  const sorted = [...eligible].sort((a, b) => (seatById.get(a) ?? 999) - (seatById.get(b) ?? 999));
+  if (actorSeat === undefined) return sorted;
+
+  const splitIdx = sorted.findIndex(id => (seatById.get(id) ?? 999) > actorSeat);
+  return splitIdx >= 0
+    ? [...sorted.slice(splitIdx), ...sorted.slice(0, splitIdx)]
+    : sorted;
+}
+
 // ─── Player Actions ───────────────────────────────────────────────
 async function playerAction(action, amount = 0) {
   if (isProcessingAction) return;
@@ -275,7 +290,7 @@ async function playerAction(action, amount = 0) {
     let newState = { ...state };
     newState.player_bets = { ...state.player_bets };
     newState.player_contributions = { ...state.player_contributions };
-    newState.acting_order = [...state.acting_order.slice(1)]; // remove current player
+    newState.acting_order = state.acting_order.filter(id => id !== myPlayerId); // remove current player robustly
     newState.all_in_players = [...(state.all_in_players || [])];
 
     switch (action) {
@@ -303,7 +318,7 @@ async function playerAction(action, amount = 0) {
         betAmount = callAmount;
         await supabaseClient.from('room_players').update({ chips: player.chips - callAmount }).eq('id', myPlayerId);
         if (player.chips - callAmount === 0) {
-          newState.all_in_players.push(myPlayerId);
+          if (!newState.all_in_players.includes(myPlayerId)) newState.all_in_players.push(myPlayerId);
           newState.active_player_ids = state.active_player_ids.filter(id => id !== myPlayerId);
           await supabaseClient.from('room_players').update({ status: 'all_in' }).eq('id', myPlayerId);
         }
@@ -326,21 +341,11 @@ async function playerAction(action, amount = 0) {
         betAmount = additional;
 
         // Rebuild acting order: all other active non-folded players need to act again
-        const activePlayers = allPlayers.filter(p =>
-          p.status === 'active' && p.id !== myPlayerId
-        );
-        // Order them starting from the player after current
-        const sortedBySeat = activePlayers.sort((a, b) => a.seat - b.seat);
-        const currentSeat = player.seat;
-        const myIdx = sortedBySeat.findIndex(p => p.seat > currentSeat);
-        const reordered = myIdx >= 0
-          ? [...sortedBySeat.slice(myIdx), ...sortedBySeat.slice(0, myIdx)]
-          : sortedBySeat;
-        newState.acting_order = reordered.map(p => p.id);
+        newState.acting_order = buildReopenedActingOrder(newState, myPlayerId);
 
         await supabaseClient.from('room_players').update({ chips: player.chips - additional }).eq('id', myPlayerId);
         if (player.chips - additional === 0) {
-          newState.all_in_players.push(myPlayerId);
+          if (!newState.all_in_players.includes(myPlayerId)) newState.all_in_players.push(myPlayerId);
           newState.active_player_ids = state.active_player_ids.filter(id => id !== myPlayerId);
           await supabaseClient.from('room_players').update({ status: 'all_in' }).eq('id', myPlayerId);
           await logAction(currentRoom.id, myPlayerId, player.name, 'raises all-in', additional);
@@ -359,17 +364,10 @@ async function playerAction(action, amount = 0) {
         if (totalBet > state.current_bet) {
           newState.current_bet = totalBet;
           newState.last_aggressor_id = myPlayerId;
-          const activePlayers = allPlayers.filter(p => p.status === 'active' && p.id !== myPlayerId);
-          const sortedBySeat = activePlayers.sort((a, b) => a.seat - b.seat);
-          const currentSeat = player.seat;
-          const myIdx = sortedBySeat.findIndex(p => p.seat > currentSeat);
-          const reordered = myIdx >= 0
-            ? [...sortedBySeat.slice(myIdx), ...sortedBySeat.slice(0, myIdx)]
-            : sortedBySeat;
-          newState.acting_order = reordered.map(p => p.id);
+          newState.acting_order = buildReopenedActingOrder(newState, myPlayerId);
         }
         betAmount = allChips;
-        newState.all_in_players.push(myPlayerId);
+        if (!newState.all_in_players.includes(myPlayerId)) newState.all_in_players.push(myPlayerId);
         newState.active_player_ids = state.active_player_ids.filter(id => id !== myPlayerId);
         await supabaseClient.from('room_players').update({ chips: 0, status: 'all_in' }).eq('id', myPlayerId);
         await logAction(currentRoom.id, myPlayerId, player.name, 'goes all-in', allChips);
@@ -378,16 +376,10 @@ async function playerAction(action, amount = 0) {
     }
 
     // Check if betting round is over
-    const activePlayers = allPlayers.filter(p => p.status === 'active');
-    const stillToAct = newState.acting_order.filter(id =>
-      allPlayers.find(p => p.id === id && p.status === 'active')
+    const eligibleToAct = new Set(
+      (newState.active_player_ids || []).filter(id => !(newState.all_in_players || []).includes(id))
     );
-
-    // Filter out just-folded player
-    const newActivePlayers = newState.active_player_ids || [];
-    const nonFoldedNonAllin = newActivePlayers.filter(id =>
-      !newState.all_in_players.includes(id)
-    );
+    const stillToAct = newState.acting_order.filter(id => eligibleToAct.has(id));
 
     // Check win conditions
     if (newState.active_player_ids.filter(id => !newState.all_in_players.includes(id)).length <= 1 &&
@@ -411,22 +403,21 @@ async function playerAction(action, amount = 0) {
 }
 
 async function processEndOfBettingRound(state) {
-  const activeFolded = allPlayers.filter(p => p.status === 'active' || p.status === 'all_in');
-  const nonFolded = state.active_player_ids || activeFolded.map(p => p.id);
+  const nonFolded = state.active_player_ids || [];
 
   // Reset per-round bets
   const newPlayerBets = {};
   for (const id of Object.keys(state.player_bets)) newPlayerBets[id] = 0;
 
   // Check if only one player left (everyone else folded)
-  if (nonFolded.filter(id => !state.all_in_players?.includes(id)).length === 0 && nonFolded.length === 1) {
-    // One player wins without showdown
+  if (nonFolded.length === 1) {
+    // One player remains in hand (wins immediately)
     await awardPot(state, [nonFolded[0]], false);
     return;
   }
 
-  if (nonFolded.length <= 1 && (state.all_in_players?.length > 0 || nonFolded.length === 1)) {
-    // Run out the board
+  if (nonFolded.length > 1 && nonFolded.every(id => (state.all_in_players || []).includes(id))) {
+    // Everyone remaining is all-in: run out the board
     await runOutBoard(state);
     return;
   }
@@ -511,7 +502,11 @@ async function runOutBoard(state) {
 async function doShowdown(state) {
   const nonFolded = state.active_player_ids || [];
   const allIn = state.all_in_players || [];
-  const showdownPlayers = [...new Set([...nonFolded, ...allIn])];
+  const showdownSet = new Set([...nonFolded, ...allIn]);
+  const showdownPlayers = allPlayers
+    .filter(p => showdownSet.has(p.id))
+    .sort((a, b) => a.seat - b.seat)
+    .map(p => p.id);
 
   if (showdownPlayers.length === 0) return;
   if (showdownPlayers.length === 1) {
@@ -519,14 +514,15 @@ async function doShowdown(state) {
     return;
   }
 
-  await logAction(currentRoom.id, 'system', 'Dealer', 'Showdown! Players must show or muck.', 0);
+  await logAction(currentRoom.id, 'system', 'Dealer', 'Showdown! Players decide show or muck in order.', 0);
 
   const newState = {
     ...state,
     phase: 'showdown',
     showdown_needed: [...showdownPlayers],
     showdown_decisions: {},
-    optional_reveals: {}
+    optional_reveals: {},
+    showdown_current_player_id: showdownPlayers[0] || null
   };
   await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
 }
@@ -535,6 +531,7 @@ async function playerReveal(show) {
   if (!gameState || isProcessingAction) return;
   const needed = gameState.showdown_needed || [];
   const decisions = gameState.showdown_decisions || {};
+  const currentShowdownPlayerId = gameState.showdown_current_player_id || needed.find(id => decisions[id] === undefined) || null;
 
   if (!needed.includes(myPlayerId)) {
     // Optional reveal for folded players
@@ -546,6 +543,7 @@ async function playerReveal(show) {
     return;
   }
 
+  if (currentShowdownPlayerId && myPlayerId !== currentShowdownPlayerId) return;
   if (decisions[myPlayerId] !== undefined) return;
 
   isProcessingAction = true;
@@ -555,7 +553,12 @@ async function playerReveal(show) {
     const allOthersMucked = needed.filter(id => id !== myPlayerId).every(id => newDecisions[id] === false);
     if (allOthersMucked && !show) newDecisions[myPlayerId] = true;
 
-    const newState = { ...gameState, showdown_decisions: newDecisions };
+    const nextPlayerId = needed.find(id => newDecisions[id] === undefined) || null;
+    const newState = {
+      ...gameState,
+      showdown_decisions: newDecisions,
+      showdown_current_player_id: nextPlayerId
+    };
     const stillUndecided = needed.filter(id => newDecisions[id] === undefined);
 
     if (stillUndecided.length === 0) {
@@ -975,7 +978,6 @@ function renderGame() {
   patchSidebarPlayers();
   renderActionPanel();
   renderPhase();
-  checkAndShowWinner();
 }
 
 // ── Seats: create once per slot, patch content each render ────────
@@ -1099,6 +1101,9 @@ function patchCommunityCards() {
   if (!container) return;
 
   const cards = gameState.community_cards || [];
+  const phase = gameState.phase;
+  const baseVisibleSlots = phase === 'turn' ? 4 : (phase === 'river' || phase === 'showdown') ? 5 : 3;
+  const visibleSlots = Math.max(baseVisibleSlots, cards.length);
   const isNewRound = gameState.round_number !== _prevRound;
   if (isNewRound) {
     _prevCommunityCards = [];
@@ -1112,6 +1117,9 @@ function patchCommunityCards() {
       el.id = `cc-${i}`;
       container.appendChild(el);
     }
+
+    el.style.display = i < visibleSlots ? '' : 'none';
+    if (i >= visibleSlots) continue;
 
     if (i >= cards.length) {
       if (el.className !== 'community-card placeholder') {
@@ -1346,40 +1354,25 @@ function renderActionPanel() {
     return;
   }
 
-  // Showdown reveal/muck phase — use the main action panel
+  // Showdown ordered show/muck phase
   if (gameState.phase === 'showdown' && gameState.showdown_needed && !gameState.round_done) {
     const needed = gameState.showdown_needed || [];
     const decisions = gameState.showdown_decisions || {};
-    const myDecision = decisions[myPlayerId];
-    const iAmNeeded = needed.includes(myPlayerId);
-    const isFolded = myStatus === 'folded';
+    const currentShowdownPlayerId = gameState.showdown_current_player_id || needed.find(id => decisions[id] === undefined) || null;
+    const currentPlayer = allPlayers.find(p => p.id === currentShowdownPlayerId);
+    const remaining = needed.filter(id => decisions[id] === undefined).length;
 
-    if (iAmNeeded && myDecision === undefined) {
+    if (myPlayerId === currentShowdownPlayerId) {
       panel.classList.add('visible');
       showShowdownButtons('Show Hand', true);
-      statusText.textContent = 'Show your hand or muck?';
+      statusText.textContent = 'Showdown: your turn to show or muck.';
       statusText.className = 'game-status-text highlight';
-    } else if (isFolded && !decisions[myPlayerId]) {
-      const optReveals = gameState.optional_reveals || {};
-      if (optReveals[myPlayerId] === undefined) {
-        panel.classList.add('visible');
-        showShowdownButtons('Show Folded Cards', false);
-        statusText.textContent = 'Show your folded cards? (optional)';
-        statusText.className = 'game-status-text';
-      } else {
-        panel.classList.remove('visible');
-        statusText.textContent = 'Waiting for others to decide...';
-        statusText.className = 'game-status-text';
-      }
-    } else if (iAmNeeded && myDecision !== undefined) {
-      panel.classList.remove('visible');
-      const remaining = needed.filter(id => decisions[id] === undefined).length;
-      statusText.textContent = remaining > 0 ? `Waiting for ${remaining} player(s)...` : 'Resolving...';
-      statusText.className = 'game-status-text';
     } else {
       panel.classList.remove('visible');
-      const remaining = needed.filter(id => decisions[id] === undefined).length;
-      statusText.textContent = remaining > 0 ? `Showdown: waiting for ${remaining} player(s)` : 'Showdown resolving...';
+      hideAllButtons();
+      statusText.textContent = remaining > 0
+        ? `Showdown: waiting for ${currentPlayer?.name || 'next player'} (${remaining} left)`
+        : 'Showdown resolving...';
       statusText.className = 'game-status-text';
     }
     return;
@@ -1481,12 +1474,7 @@ function showPhaseBanner(text) {
 }
 
 function checkAndShowWinner() {
-  if (!gameState.round_done || !gameState.winners?.length) return;
-  // Only show once per round
-  const winnerKey = `${gameState.round_number}:${gameState.winners.join(',')}`;
-  if (_shownWinner === winnerKey) return;
-  _shownWinner = winnerKey;
-  showWinnerOverlay(gameState.winners, gameState.evaluations, gameState.pot, gameState.community_cards, gameState.hands);
+  return;
 }
 
 function showWinnerOverlay(winners, evaluations, pot, communityCards, hands) {

@@ -353,6 +353,11 @@ body { overflow-y: auto; }
   animation: pulse-gold 1.5s ease-in-out infinite;
 }
 
+.player-seat.is-turn .player-info {
+  border-color: rgba(201,162,39,0.65);
+  box-shadow: 0 0 18px rgba(201,162,39,0.35);
+}
+
 @keyframes pulse-gold {
   0%, 100% {
     box-shadow: 0 0 8px rgba(201,162,39,0.5), 0 0 0 0 rgba(201,162,39,0.3);
@@ -456,6 +461,24 @@ body { overflow-y: auto; }
   box-shadow: 0 2px 6px rgba(0,0,0,0.5);
 }
 
+.turn-seat-badge {
+  position: absolute;
+  top: -18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: linear-gradient(135deg, var(--gold-light), var(--gold));
+  color: #000;
+  border: 1px solid rgba(255,255,255,0.55);
+  border-radius: 999px;
+  font-size: 0.58rem;
+  letter-spacing: 0.8px;
+  font-weight: 800;
+  padding: 2px 8px;
+  white-space: nowrap;
+  text-transform: uppercase;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.45);
+}
+
 /* Hole cards on seat */
 .seat-cards {
   display: flex;
@@ -493,6 +516,25 @@ body { overflow-y: auto; }
   gap: 14px;
   z-index: 1;
   position: relative;
+}
+
+.turn-indicator {
+  background: rgba(201,162,39,0.14);
+  border: 1px solid rgba(201,162,39,0.55);
+  color: var(--gold-light);
+  border-radius: 999px;
+  padding: 6px 16px;
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  box-shadow: 0 0 16px rgba(201,162,39,0.25);
+  animation: turnIndicatorPulse 1.15s ease-in-out infinite;
+}
+
+@keyframes turnIndicatorPulse {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.05); opacity: 1; }
 }
 
 .pot-display {
@@ -745,6 +787,9 @@ body { overflow-y: auto; }
 .btn-allin { background: rgba(150,0,200,0.3); color: #d080ff; border: 1px solid rgba(150,0,200,0.5); grid-column: 1/-1; }
 .btn-allin:hover { background: rgba(150,0,200,0.5); }
 
+.btn-rebuy { background: rgba(80,180,255,0.25); color: #80c8ff; border: 1px solid rgba(80,180,255,0.5); grid-column: 1/-1; }
+.btn-rebuy:hover { background: rgba(80,180,255,0.45); }
+
 .raise-controls {
   display: none;
   gap: 8px;
@@ -838,6 +883,15 @@ body { overflow-y: auto; }
   gap: 10px;
   padding: 6px 0;
   border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.player-row.is-turn-row {
+  background: rgba(201,162,39,0.14);
+  border: 1px solid rgba(201,162,39,0.45);
+  border-radius: 8px;
+  padding: 8px 8px;
+  margin: 2px 0;
+  box-shadow: 0 0 12px rgba(201,162,39,0.2);
 }
 
 .player-row:last-child { border-bottom: none; }

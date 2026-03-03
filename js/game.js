@@ -13,6 +13,14 @@ let subscriptions = [];
 let isProcessingAction = false;
 let lastSyncedMyChips = null;
 let isSyncingMyStats = false;
+let gameStateUpdatedAt = null;
+let _roundAdvanceInFlight = false;
+let _lastRoundAdvanceAttemptAt = 0;
+let _roundAdvanceInterval = null;
+let _turnTimeoutInFlight = false;
+let _lastTurnTimeoutAttemptAt = 0;
+
+const TURN_ACTION_SECONDS = 10;
 
 // ─── Init ─────────────────────────────────────────────────────────
 function initSupabase() {
@@ -68,11 +76,17 @@ async function joinRoom(roomId, playerName) {
 
   // Check player count
   const { data: players } = await supabaseClient.from('room_players').select('*').eq('room_id', roomId);
+  const activePlayers = (players || []).filter(p => p.status !== 'out');
   const existing = players?.find(p => p.id === myPlayerId);
 
   if (room.status === 'playing') {
-    // Only allow rejoining if player was previously in this room
-    if (!existing) throw new Error('Game already in progress');
+    // Allow joining mid-game (new players start on next hand)
+    if (!existing) {
+      if (activePlayers.length >= room.max_players) throw new Error('Room is full');
+      await joinRoomAsPlayer(roomId, playerName, room.starting_chips);
+      await logAction(roomId, myPlayerId, playerName, 'joined in-progress game (next hand)', room.starting_chips);
+      return { room, isRebuy: false };
+    }
     if (existing.status === 'out') {
       // Player left — do a rebuy with a fresh starting stack
       await supabaseClient.from('room_players').update({
@@ -91,7 +105,7 @@ async function joinRoom(roomId, playerName) {
 
   // Room is waiting
   if (!existing) {
-    if (players && players.length >= room.max_players) throw new Error('Room is full');
+    if (activePlayers.length >= room.max_players) throw new Error('Room is full');
     await joinRoomAsPlayer(roomId, playerName, room.starting_chips);
   } else {
     // Update name / reconnect
@@ -101,7 +115,12 @@ async function joinRoom(roomId, playerName) {
 }
 
 async function joinRoomAsPlayer(roomId, playerName, chips) {
-  const { data: players } = await supabaseClient.from('room_players').select('seat').eq('room_id', roomId).order('seat');
+  const { data: players } = await supabaseClient
+    .from('room_players')
+    .select('seat,status')
+    .eq('room_id', roomId)
+    .neq('status', 'out')
+    .order('seat');
   const usedSeats = players ? players.map(p => p.seat) : [];
   const seat = findNextSeat(usedSeats);
 
@@ -129,6 +148,34 @@ function generateRoomCode() {
   let code = '';
   for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
+}
+
+function applyTurnDeadline(state, turnPlayerId = state?.current_player_id) {
+  const inActionPhase = !!state
+    && !state.round_done
+    && state.phase !== 'waiting'
+    && state.phase !== 'showdown';
+
+  if (!inActionPhase || !turnPlayerId) {
+    return {
+      ...state,
+      action_turn_player_id: null,
+      action_deadline_at: null,
+      timeout_action_lock: null
+    };
+  }
+
+  return {
+    ...state,
+    action_turn_player_id: turnPlayerId,
+    action_deadline_at: new Date(Date.now() + TURN_ACTION_SECONDS * 1000).toISOString(),
+    timeout_action_lock: null
+  };
+}
+
+function getActionDeadlineMs(state) {
+  const ts = Date.parse(state?.action_deadline_at || '');
+  return Number.isFinite(ts) ? ts : null;
 }
 
 async function fetchRooms() {
@@ -195,7 +242,7 @@ async function dealNewHand(activePlayers, prevDealerSeat, roundNumber) {
   // After BB posts, acting order is from player after BB going around to BB
   const preflopOrder = buildPreflopActingOrder(sorted, bbIndex);
 
-  const newState = {
+  const baseState = {
     phase: 'preflop',
     deck: deck,
     hands,
@@ -217,6 +264,7 @@ async function dealNewHand(activePlayers, prevDealerSeat, roundNumber) {
     active_player_ids: sorted.map(p => p.id),
     winners: null
   };
+  const newState = applyTurnDeadline(baseState, baseState.current_player_id);
 
   // Reset player statuses
   for (const p of sorted) {
@@ -226,7 +274,9 @@ async function dealNewHand(activePlayers, prevDealerSeat, roundNumber) {
     }).eq('id', p.id);
   }
 
-  await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+  const updatedAt = new Date().toISOString();
+  await supabaseClient.from('game_state').update({ state: newState, updated_at: updatedAt }).eq('room_id', currentRoom.id);
+  gameStateUpdatedAt = updatedAt;
 
   // Log
   await logAction(currentRoom.id, 'system', 'Dealer', `New hand #${roundNumber + 1} - Dealer: Seat ${dealerSeat}`, 0);
@@ -386,6 +436,12 @@ async function playerAction(action, amount = 0) {
       }
     }
 
+    const contenders = getHandContenders(newState);
+    if (contenders.length <= 1) {
+      await processEndOfBettingRound(newState);
+      return;
+    }
+
     // Check if betting round is over
     const eligibleToAct = new Set(
       (newState.active_player_ids || []).filter(id => !(newState.all_in_players || []).includes(id))
@@ -406,7 +462,10 @@ async function playerAction(action, amount = 0) {
     } else {
       // Continue to next player
       newState.current_player_id = stillToAct[0];
-      await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+      const timedState = applyTurnDeadline(newState, newState.current_player_id);
+      const updatedAt = new Date().toISOString();
+      await supabaseClient.from('game_state').update({ state: timedState, updated_at: updatedAt }).eq('room_id', currentRoom.id);
+      gameStateUpdatedAt = updatedAt;
     }
   } finally {
     isProcessingAction = false;
@@ -414,21 +473,25 @@ async function playerAction(action, amount = 0) {
 }
 
 async function processEndOfBettingRound(state) {
-  const nonFolded = state.active_player_ids || [];
+  const activePlayers = state.active_player_ids || [];
+  const allInPlayers = state.all_in_players || [];
+  const contenders = [...new Set([...activePlayers, ...allInPlayers])];
+  const actionablePlayers = activePlayers.filter(id => !allInPlayers.includes(id));
 
   // Reset per-round bets
   const newPlayerBets = {};
   for (const id of Object.keys(state.player_bets)) newPlayerBets[id] = 0;
 
   // Check if only one player left (everyone else folded)
-  if (nonFolded.length === 1) {
+  if (contenders.length <= 1) {
     // One player remains in hand (wins immediately)
-    await awardPot(state, [nonFolded[0]], false);
+    await awardPot(state, contenders, false);
     return;
   }
 
-  if (nonFolded.length > 1 && nonFolded.every(id => (state.all_in_players || []).includes(id))) {
-    // Everyone remaining is all-in: run out the board
+  // If one or fewer players can still act, no further betting is possible.
+  // Run out the board for showdown among remaining contenders.
+  if (actionablePlayers.length <= 1) {
     await runOutBoard(state);
     return;
   }
@@ -463,7 +526,8 @@ async function advanceToFlop(state, newPlayerBets) {
     last_aggressor_id: null
   };
   newState.current_player_id = newState.acting_order[0];
-  await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+  const timedState = applyTurnDeadline(newState, newState.current_player_id);
+  await supabaseClient.from('game_state').update({ state: timedState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
   await logAction(currentRoom.id, 'system', 'Dealer', 'Flop dealt', 0);
 }
 
@@ -479,7 +543,8 @@ async function advanceToTurn(state, newPlayerBets) {
     last_aggressor_id: null
   };
   newState.current_player_id = newState.acting_order[0];
-  await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+  const timedState = applyTurnDeadline(newState, newState.current_player_id);
+  await supabaseClient.from('game_state').update({ state: timedState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
   await logAction(currentRoom.id, 'system', 'Dealer', 'Turn dealt', 0);
 }
 
@@ -495,7 +560,8 @@ async function advanceToRiver(state, newPlayerBets) {
     last_aggressor_id: null
   };
   newState.current_player_id = newState.acting_order[0];
-  await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+  const timedState = applyTurnDeadline(newState, newState.current_player_id);
+  await supabaseClient.from('game_state').update({ state: timedState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
   await logAction(currentRoom.id, 'system', 'Dealer', 'River dealt', 0);
 }
 
@@ -505,7 +571,7 @@ async function runOutBoard(state) {
   const deck = [...state.deck];
   while (community.length < 5) community.push(deck.pop());
 
-  const newState = { ...state, community_cards: community, deck, phase: 'showdown' };
+  const newState = applyTurnDeadline({ ...state, community_cards: community, deck, phase: 'showdown' }, null);
   await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
   await doShowdown(newState);
 }
@@ -522,16 +588,36 @@ async function doShowdown(state) {
     return;
   }
 
+  const isAllInOnlyShowdown = showdownPlayers.every(id => {
+    const player = allPlayers.find(p => p.id === id);
+    return player?.status === 'all_in';
+  });
+
+  if (isAllInOnlyShowdown) {
+    const playerHandData = showdownPlayers
+      .map(id => ({ id, cards: state.hands?.[id] || [] }))
+      .filter(p => p.cards.length === 2);
+
+    if (playerHandData.length === 0) {
+      await awardPot(state, showdownPlayers, false);
+      return;
+    }
+
+    const { winners, evaluations } = determineWinners(playerHandData, state.community_cards || []);
+    await awardPot(state, winners, true, evaluations);
+    return;
+  }
+
   await logAction(currentRoom.id, 'system', 'Dealer', 'Showdown! Players decide show or muck in order.', 0);
 
-  const newState = {
+  const newState = applyTurnDeadline({
     ...state,
     phase: 'showdown',
     showdown_needed: [...showdownPlayers],
     showdown_decisions: {},
     optional_reveals: {},
     showdown_current_player_id: showdownPlayers[0] || null
-  };
+  }, null);
   await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
 }
 
@@ -600,6 +686,11 @@ async function finalizeShowdown(state) {
     .map(id => ({ id, cards: state.hands[id] || [] }))
     .filter(p => p.cards.length === 2);
 
+  if (playerHandData.length === 0) {
+    await awardPot(state, needed, false);
+    return;
+  }
+
   const { winners, evaluations } = determineWinners(playerHandData, state.community_cards);
 
   for (const ev of evaluations) {
@@ -613,22 +704,129 @@ async function finalizeShowdown(state) {
   await awardPot(state, winners, true, evaluations);
 }
 
+function getHandContenders(state) {
+  const activePlayers = state.active_player_ids || [];
+  const allInPlayers = state.all_in_players || [];
+  return [...new Set([...activePlayers, ...allInPlayers])];
+}
+
+function calculateSidePotsFromContributions(contributions = {}) {
+  const contribs = Object.entries(contributions)
+    .map(([id, amount]) => ({ id, amount: Number(amount || 0) }))
+    .filter(c => c.amount > 0)
+    .sort((a, b) => a.amount - b.amount);
+
+  if (!contribs.length) return [];
+
+  const levels = [...new Set(contribs.map(c => c.amount))];
+  const pots = [];
+  let previousLevel = 0;
+
+  for (const level of levels) {
+    const layer = level - previousLevel;
+    if (layer <= 0) continue;
+
+    const contributors = contribs.filter(c => c.amount >= level).map(c => c.id);
+    if (!contributors.length) continue;
+
+    pots.push({
+      amount: layer * contributors.length,
+      eligible: contributors
+    });
+    previousLevel = level;
+  }
+
+  return pots;
+}
+
 async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
-  const pot = state.pot;
-  const perWinner = Math.floor(pot / winnerIds.length);
-  const remainder = pot % winnerIds.length;
+  const pot = Number(state.pot || 0);
+  const contributions = state.player_contributions || {};
+  const evaluationIds = (evaluations || []).map(e => e.id);
+  const showdownEligibleIds = evaluationIds.length
+    ? [...new Set(evaluationIds)]
+    : [...new Set(winnerIds || [])];
+  const sortedWinnerIds = sortPlayerIdsBySeat([...(winnerIds || [])]);
+  const winningsById = {};
+
+  function addWinnings(playerId, amount) {
+    if (!playerId || amount <= 0) return;
+    winningsById[playerId] = (winningsById[playerId] || 0) + amount;
+  }
+
+  if (isShowdown) {
+    const sidePots = calculateSidePotsFromContributions(contributions);
+    const effectivePots = sidePots.length > 0
+      ? sidePots
+      : [{ amount: pot, eligible: getHandContenders(state) }];
+
+    for (const sidePot of effectivePots) {
+      const eligible = sidePot.eligible.filter(id => showdownEligibleIds.includes(id));
+      if (!eligible.length) continue;
+
+      let sideWinners = [];
+      if (eligible.length === 1) {
+        sideWinners = [eligible[0]];
+      } else {
+        const sideHandData = eligible
+          .map(id => ({ id, cards: state.hands?.[id] || [] }))
+          .filter(p => p.cards.length === 2);
+
+        if (sideHandData.length === 0) {
+          sideWinners = sortPlayerIdsBySeat(eligible).slice(0, 1);
+        } else if (sideHandData.length === 1) {
+          sideWinners = [sideHandData[0].id];
+        } else {
+          const sideResult = determineWinners(sideHandData, state.community_cards || []);
+          sideWinners = sideResult.winners?.length
+            ? sortPlayerIdsBySeat(sideResult.winners)
+            : sortPlayerIdsBySeat([sideHandData[0].id]);
+        }
+      }
+
+      const perWinner = Math.floor(sidePot.amount / sideWinners.length);
+      const remainder = sidePot.amount % sideWinners.length;
+      sideWinners.forEach((id, idx) => addWinnings(id, perWinner + (idx === 0 ? remainder : 0)));
+    }
+  } else {
+    const directWinners = sortedWinnerIds.length
+      ? sortedWinnerIds
+      : sortPlayerIdsBySeat(getHandContenders(state)).slice(0, 1);
+
+    const perWinner = directWinners.length ? Math.floor(pot / directWinners.length) : 0;
+    const remainder = directWinners.length ? pot % directWinners.length : pot;
+    directWinners.forEach((id, idx) => addWinnings(id, perWinner + (idx === 0 ? remainder : 0)));
+  }
+
+  const distributed = Object.values(winningsById).reduce((sum, val) => sum + val, 0);
+  if (distributed < pot) {
+    const fallbackId = sortPlayerIdsBySeat([
+      ...new Set([
+        ...(sortedWinnerIds || []),
+        ...showdownEligibleIds,
+        ...getHandContenders(state)
+      ])
+    ])[0];
+    addWinnings(fallbackId, pot - distributed);
+  }
+
+  const paidWinnerIds = Object.keys(winningsById).filter(id => winningsById[id] > 0);
+  if (!paidWinnerIds.length) return;
 
   // Fetch current chips
   const { data: players } = await supabaseClient.from('room_players').select('*').eq('room_id', currentRoom.id);
+  const handNameByPlayerId = new Map((evaluations || [])
+    .filter(e => e?.id && e?.hand?.name)
+    .map(e => [e.id, e.hand.name]));
 
-  for (let i = 0; i < winnerIds.length; i++) {
-    const winner = players?.find(p => p.id === winnerIds[i]);
+  for (const winnerId of paidWinnerIds) {
+    const winner = players?.find(p => p.id === winnerId);
     if (winner) {
-      const won = perWinner + (i === 0 ? remainder : 0);
+      const won = winningsById[winnerId] || 0;
       await supabaseClient.from('room_players').update({ chips: winner.chips + won }).eq('id', winner.id);
-      const eval_ = evaluations.find(e => e.id === winner.id);
+      const handName = handNameByPlayerId.get(winner.id);
       await logAction(currentRoom.id, winner.id, winner.name,
-        `wins ${won} chips${isShowdown && eval_?.hand ? ' with ' + eval_.hand.name : ''}`, won);
+        `wins ${won} chips${isShowdown && handName ? ' with ' + handName : ''}`, won);
     }
   }
 
@@ -636,31 +834,222 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
   const newState = {
     ...state,
     phase: 'showdown',
-    winners: winnerIds,
+    winners: paidWinnerIds,
     evaluations,
-    round_done: true
+    round_done: true,
+    round_done_at: new Date().toISOString(),
+    next_hand_at: new Date(Date.now() + 5000).toISOString(),
+    round_transition_lock: null,
+    action_turn_player_id: null,
+    action_deadline_at: null,
+    timeout_action_lock: null
   };
-  await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
+  const updatedAt = new Date().toISOString();
+  await supabaseClient.from('game_state').update({ state: newState, updated_at: updatedAt }).eq('room_id', currentRoom.id);
+  gameStateUpdatedAt = updatedAt;
 
   // Update lifetime hand counters (net chips are synced live during play)
-  await updatePlayerStats(state, winnerIds, { updateNetChips: false });
+  await updatePlayerStats(state, paidWinnerIds, { updateNetChips: false });
+  await maybeAdvanceRoundAfterPayout();
+}
 
-  // Auto-start next hand after delay
-  setTimeout(async () => {
-    const { data: currentPlayers } = await supabaseClient.from('room_players').select('*').eq('room_id', currentRoom.id);
-    const eligible = currentPlayers?.filter(p => p.chips > 0 && p.status !== 'out');
-    if (eligible && eligible.length >= 2) {
-      // Reset statuses
-      for (const p of eligible) {
-        await supabaseClient.from('room_players').update({ status: 'waiting' }).eq('id', p.id);
-      }
-      await dealNewHand(eligible, state.dealer_seat, (state.round_number || 0) + 1);
-    } else {
-      // Game over
-      await supabaseClient.from('rooms').update({ status: 'finished' }).eq('id', currentRoom.id);
-      await logAction(currentRoom.id, 'system', 'Dealer', 'Game over!', 0);
+function getNextHandAtMs(state, fallbackUpdatedAt) {
+  const explicitMs = Date.parse(state?.next_hand_at || '');
+  if (Number.isFinite(explicitMs)) return explicitMs;
+
+  const baseMs = Date.parse(state?.round_done_at || fallbackUpdatedAt || '');
+  return Number.isFinite(baseMs) ? baseMs + 5000 : Date.now() + 5000;
+}
+
+async function advanceRoundAfterPayout(lockedState) {
+  const { data: currentPlayers } = await supabaseClient
+    .from('room_players')
+    .select('*')
+    .eq('room_id', currentRoom.id);
+
+  const bustedPlayers = (currentPlayers || []).filter(p => p.chips <= 0 && p.status !== 'out');
+  for (const busted of bustedPlayers) {
+    await supabaseClient
+      .from('room_players')
+      .update({ status: 'out' })
+      .eq('id', busted.id)
+      .eq('room_id', currentRoom.id);
+    await logAction(currentRoom.id, busted.id, busted.name, 'busted out', 0);
+  }
+
+  const { data: refreshedPlayers } = await supabaseClient
+    .from('room_players')
+    .select('*')
+    .eq('room_id', currentRoom.id);
+
+  const eligible = (refreshedPlayers || []).filter(p => p.chips > 0 && p.status !== 'out');
+  if (eligible.length >= 2) {
+    for (const p of eligible) {
+      await supabaseClient.from('room_players').update({ status: 'waiting' }).eq('id', p.id);
     }
-  }, 5000);
+    await dealNewHand(eligible, lockedState.dealer_seat, (lockedState.round_number || 0) + 1);
+    return;
+  }
+
+  await supabaseClient.from('rooms').update({ status: 'finished' }).eq('id', currentRoom.id);
+  await logAction(currentRoom.id, 'system', 'Dealer', 'Game over!', 0);
+}
+
+async function maybeAdvanceRoundAfterPayout() {
+  if (!currentRoom || currentRoom.status !== 'playing' || !gameState?.round_done) return;
+  if (_roundAdvanceInFlight) return;
+
+  const dueMs = getNextHandAtMs(gameState, gameStateUpdatedAt);
+  if (Date.now() < dueMs) return;
+
+  const now = Date.now();
+  if (now - _lastRoundAdvanceAttemptAt < 1000) return;
+  _lastRoundAdvanceAttemptAt = now;
+
+  const expectedUpdatedAt = gameStateUpdatedAt;
+  if (!expectedUpdatedAt) return;
+
+  _roundAdvanceInFlight = true;
+  try {
+    const lockState = {
+      ...gameState,
+      round_transition_lock: { by: myPlayerId, at: new Date().toISOString() }
+    };
+    const lockUpdatedAt = new Date().toISOString();
+
+    const { data: lockRow, error: lockErr } = await supabaseClient
+      .from('game_state')
+      .update({ state: lockState, updated_at: lockUpdatedAt })
+      .eq('room_id', currentRoom.id)
+      .eq('updated_at', expectedUpdatedAt)
+      .select('state, updated_at')
+      .maybeSingle();
+
+    if (lockErr || !lockRow) return;
+
+    gameState = lockRow.state || gameState;
+    gameStateUpdatedAt = lockRow.updated_at;
+    await advanceRoundAfterPayout(lockRow.state || lockState);
+  } catch (e) {
+    console.error('Round advancement failed:', e);
+  } finally {
+    _roundAdvanceInFlight = false;
+  }
+}
+
+async function processTimedOutTurn(lockedState, timedOutPlayerId) {
+  if (!timedOutPlayerId || lockedState.current_player_id !== timedOutPlayerId) return;
+
+  const player = allPlayers.find(p => p.id === timedOutPlayerId);
+  const playerName = player?.name || timedOutPlayerId;
+  const playerBet = Number(lockedState.player_bets?.[timedOutPlayerId] || 0);
+  const currentBet = Number(lockedState.current_bet || 0);
+  const canCheck = playerBet === currentBet;
+
+  const newState = {
+    ...lockedState,
+    player_bets: { ...(lockedState.player_bets || {}) },
+    player_contributions: { ...(lockedState.player_contributions || {}) },
+    acting_order: (lockedState.acting_order || []).filter(id => id !== timedOutPlayerId),
+    all_in_players: [...(lockedState.all_in_players || [])],
+    timeout_action_lock: null
+  };
+
+  if (canCheck) {
+    await logAction(currentRoom.id, timedOutPlayerId, playerName, 'checks (timeout)', 0);
+  } else {
+    await supabaseClient.from('room_players').update({ status: 'folded' }).eq('id', timedOutPlayerId);
+    newState.active_player_ids = (lockedState.active_player_ids || []).filter(id => id !== timedOutPlayerId);
+    await logAction(currentRoom.id, timedOutPlayerId, playerName, 'folds (timeout)', 0);
+  }
+
+  const contenders = getHandContenders(newState);
+  if (contenders.length <= 1) {
+    await processEndOfBettingRound(newState);
+    return;
+  }
+
+  const eligibleToAct = new Set(
+    (newState.active_player_ids || []).filter(id => !(newState.all_in_players || []).includes(id))
+  );
+  const stillToAct = newState.acting_order.filter(id => eligibleToAct.has(id));
+
+  if (newState.active_player_ids.filter(id => !(newState.all_in_players || []).includes(id)).length <= 1 &&
+      stillToAct.length === 0) {
+    await processEndOfBettingRound(newState);
+    return;
+  }
+
+  if (stillToAct.length === 0) {
+    await processEndOfBettingRound(newState);
+    return;
+  }
+
+  newState.current_player_id = stillToAct[0];
+  const timedState = applyTurnDeadline(newState, newState.current_player_id);
+  const updatedAt = new Date().toISOString();
+  await supabaseClient.from('game_state').update({ state: timedState, updated_at: updatedAt }).eq('room_id', currentRoom.id);
+  gameStateUpdatedAt = updatedAt;
+}
+
+async function maybeProcessTurnTimeout() {
+  if (!currentRoom || currentRoom.status !== 'playing' || !gameState) return;
+  if (_turnTimeoutInFlight || isProcessingAction) return;
+  if (gameState.round_done || gameState.phase === 'waiting' || gameState.phase === 'showdown') return;
+
+  const timedOutPlayerId = gameState.current_player_id;
+  if (!timedOutPlayerId) return;
+  if (gameState.action_turn_player_id && gameState.action_turn_player_id !== timedOutPlayerId) return;
+
+  const deadlineMs = getActionDeadlineMs(gameState);
+  if (!deadlineMs || Date.now() < deadlineMs) return;
+
+  const now = Date.now();
+  if (now - _lastTurnTimeoutAttemptAt < 800) return;
+  _lastTurnTimeoutAttemptAt = now;
+
+  const expectedUpdatedAt = gameStateUpdatedAt;
+  if (!expectedUpdatedAt) return;
+
+  _turnTimeoutInFlight = true;
+  try {
+    const lockState = {
+      ...gameState,
+      timeout_action_lock: {
+        by: myPlayerId,
+        at: new Date().toISOString(),
+        for_player_id: timedOutPlayerId
+      }
+    };
+    const lockUpdatedAt = new Date().toISOString();
+
+    const { data: lockRow, error: lockErr } = await supabaseClient
+      .from('game_state')
+      .update({ state: lockState, updated_at: lockUpdatedAt })
+      .eq('room_id', currentRoom.id)
+      .eq('updated_at', expectedUpdatedAt)
+      .select('state, updated_at')
+      .maybeSingle();
+
+    if (lockErr || !lockRow) return;
+
+    gameState = lockRow.state || gameState;
+    gameStateUpdatedAt = lockRow.updated_at;
+    await processTimedOutTurn(lockRow.state || lockState, timedOutPlayerId);
+  } catch (e) {
+    console.error('Turn timeout processing failed:', e);
+  } finally {
+    _turnTimeoutInFlight = false;
+  }
+}
+
+function startRoundAdvanceWatcher() {
+  if (_roundAdvanceInterval) clearInterval(_roundAdvanceInterval);
+  _roundAdvanceInterval = setInterval(() => {
+    maybeProcessTurnTimeout();
+    maybeAdvanceRoundAfterPayout();
+    patchTurnIndicator();
+  }, 1000);
 }
 
 function buildPostflopOrder(state) {
@@ -912,8 +1301,11 @@ function subscribeToRoom(roomId) {
       filter: `room_id=eq.${roomId}`
     }, async (payload) => {
       gameState = payload.new?.state || payload.new;
+      gameStateUpdatedAt = payload.new?.updated_at || null;
       await refreshPlayers();
       renderGame();
+      await maybeProcessTurnTimeout();
+      await maybeAdvanceRoundAfterPayout();
     })
     .subscribe();
 
@@ -974,17 +1366,58 @@ let _prevPhase = null;
 let _prevRound = -1;
 let _shownWinner = null;
 
+function getVisiblePlayers() {
+  return allPlayers.filter(p => p.status !== 'out');
+}
+
 function renderGame() {
   if (!gameState || !allPlayers.length) return;
   _rnd++;
 
+  maybeProcessTurnTimeout();
+  maybeAdvanceRoundAfterPayout();
+
   patchTableSeats();
+  patchTurnIndicator();
   patchCommunityCards();
   patchPot();
   patchMyHand();
   patchSidebarPlayers();
   renderActionPanel();
   renderPhase();
+}
+
+function patchTurnIndicator() {
+  const el = document.getElementById('turn-indicator');
+  if (!el) return;
+
+  const isActionPhase = !!gameState
+    && !gameState.round_done
+    && gameState.phase !== 'waiting'
+    && gameState.phase !== 'showdown';
+
+  if (!isActionPhase || !gameState.current_player_id) {
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+
+  const actingPlayer = allPlayers.find(p => p.id === gameState.current_player_id);
+  if (!actingPlayer) {
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+
+  const isMe = actingPlayer.id === myPlayerId;
+  const deadlineMs = getActionDeadlineMs(gameState);
+  const secondsLeft = deadlineMs
+    ? Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000))
+    : TURN_ACTION_SECONDS;
+  el.style.display = '';
+  el.textContent = isMe
+    ? `YOUR TURN · ${secondsLeft}s`
+    : `${actingPlayer.name.toUpperCase()} TO ACT · ${secondsLeft}s`;
 }
 
 // ── Seats: create once per slot, patch content each render ────────
@@ -1005,7 +1438,7 @@ function patchTableSeats() {
 }
 
 function patchSeat(el, seatIdx) {
-  const player = allPlayers.find(p => p.seat === seatIdx);
+  const player = getVisiblePlayers().find(p => p.seat === seatIdx);
 
   if (!player) {
     // Only rebuild if it wasn't already empty
@@ -1064,7 +1497,7 @@ function patchSeat(el, seatIdx) {
       cardsHtml = `<div class="seat-cards">${playerCards.map((c, ci) => pocketCardHtml(c, true, dealClass, ci * 80)).join('')}</div>`;
       el.dataset.cardsDealt = '1';
       el.dataset.roundDealt = String(gameState.round_number);
-    } else if (!isFolded) {
+      } else if (!isFolded && playerCards) {
       const newHand = !el.dataset.cardsDealt || el.dataset.roundDealt !== String(gameState.round_number);
       const dealClass = newHand ? ' deal-in' : '';
       cardsHtml = `<div class="seat-cards">
@@ -1077,10 +1510,12 @@ function patchSeat(el, seatIdx) {
   }
 
   const allInBadge = isAllIn ? '<div class="all-in-badge">ALL-IN</div>' : '';
+  const turnBadge = isTurn ? '<div class="turn-seat-badge">TURN</div>' : '';
 
   el.innerHTML = `
     <div class="player-avatar">
       ${avatarEmoji}
+      ${turnBadge}
       ${isDealer ? '<div class="dealer-btn">D</div>' : ''}
       ${isSB ? '<div class="blind-badge sb-badge">SB</div>' : ''}
       ${isBB ? '<div class="blind-badge bb-badge">BB</div>' : ''}
@@ -1257,15 +1692,19 @@ function patchMyHand() {
 function patchSidebarPlayers() {
   const list = document.getElementById('players-list');
   if (!list) return;
+  const visiblePlayers = getVisiblePlayers();
 
   // Remove rows for players who left
   list.querySelectorAll('[data-player-row]').forEach(row => {
-    if (!allPlayers.find(p => p.id === row.dataset.playerRow)) row.remove();
+    if (!visiblePlayers.find(p => p.id === row.dataset.playerRow)) row.remove();
   });
 
-  allPlayers.forEach((player, idx) => {
+  visiblePlayers.forEach((player, idx) => {
     const isMe = player.id === myPlayerId;
-    const isTurn = gameState.current_player_id === player.id;
+    const isTurn = gameState.current_player_id === player.id
+      && !gameState.round_done
+      && gameState.phase !== 'waiting'
+      && gameState.phase !== 'showdown';
     const statusClass = player.status === 'folded' ? 'status-folded'
       : player.status === 'all_in' ? 'status-allin'
       : isTurn ? 'status-active' : '';
@@ -1280,6 +1719,8 @@ function patchSidebarPlayers() {
       row.dataset.playerRow = player.id;
       list.appendChild(row);
     }
+
+    row.classList.toggle('is-turn-row', isTurn);
 
     // Move to correct position
     const rows = [...list.querySelectorAll('[data-player-row]')];
@@ -1317,6 +1758,7 @@ function renderActionPanel() {
   const callBtn = document.getElementById('btn-call');
   const raiseBtn = document.getElementById('btn-raise');
   const allinBtn = document.getElementById('btn-allin');
+  const rebuyBtn = document.getElementById('btn-rebuy');
   const raiseControls = document.getElementById('raise-controls');
   const chipBtnsContainer = panel.querySelector('.chip-buttons');
 
@@ -1327,6 +1769,7 @@ function renderActionPanel() {
     if (allinBtn) allinBtn.style.display = '';
     if (showBtn) showBtn.style.display = 'none';
     if (muckBtn) muckBtn.style.display = 'none';
+    if (rebuyBtn) rebuyBtn.style.display = 'none';
     if (chipBtnsContainer) chipBtnsContainer.style.display = '';
   }
 
@@ -1336,6 +1779,7 @@ function renderActionPanel() {
     if (callBtn) callBtn.style.display = 'none';
     if (raiseBtn) raiseBtn.style.display = 'none';
     if (allinBtn) allinBtn.style.display = 'none';
+    if (rebuyBtn) rebuyBtn.style.display = 'none';
     if (raiseControls) raiseControls.classList.remove('visible');
     if (chipBtnsContainer) chipBtnsContainer.style.display = 'none';
     if (showBtn) { showBtn.style.display = ''; showBtn.textContent = showText; }
@@ -1350,8 +1794,15 @@ function renderActionPanel() {
     if (allinBtn) allinBtn.style.display = 'none';
     if (showBtn) showBtn.style.display = 'none';
     if (muckBtn) muckBtn.style.display = 'none';
+    if (rebuyBtn) rebuyBtn.style.display = 'none';
     if (raiseControls) raiseControls.classList.remove('visible');
     if (chipBtnsContainer) chipBtnsContainer.style.display = 'none';
+  }
+
+  function showRebuyButton() {
+    hideAllButtons();
+    if (rebuyBtn) rebuyBtn.style.display = '';
+    panel.classList.add('visible');
   }
 
   if (gameState.phase === 'waiting') {
@@ -1402,6 +1853,13 @@ function renderActionPanel() {
   if (myStatus === 'all_in') {
     panel.classList.remove('visible');
     statusText.textContent = 'You are all-in!';
+    statusText.className = 'game-status-text highlight';
+    return;
+  }
+
+  if (myStatus === 'out') {
+    showRebuyButton();
+    statusText.textContent = 'You busted. Click Rebuy to join the next hand.';
     statusText.className = 'game-status-text highlight';
     return;
   }
@@ -1539,7 +1997,8 @@ async function updateWaitingPlayers() {
   if (!currentRoom) return;
   const list = document.getElementById('waiting-players-list');
   if (!list) return;
-  list.innerHTML = allPlayers.map(p => `
+  const visiblePlayers = getVisiblePlayers();
+  list.innerHTML = visiblePlayers.map(p => `
     <div class="waiting-player-item">
       <div class="waiting-player-dot"></div>
       <span>${escHtml(p.name)}${p.id === currentRoom.host_id ? ' (Host)' : ''}${p.id === myPlayerId ? ' (You)' : ''}</span>
@@ -1549,9 +2008,23 @@ async function updateWaitingPlayers() {
   const startBtn = document.getElementById('waiting-start-btn');
   if (startBtn) {
     startBtn.style.display = myPlayerId === currentRoom?.host_id ? 'block' : 'none';
-    startBtn.disabled = allPlayers.length < 2;
-    startBtn.textContent = allPlayers.length < 2 ? 'Waiting for players...' : `Start Game (${allPlayers.length} players)`;
+    startBtn.disabled = visiblePlayers.length < 2;
+    startBtn.textContent = visiblePlayers.length < 2 ? 'Waiting for players...' : `Start Game (${visiblePlayers.length} players)`;
   }
+}
+
+async function rebuyMyPlayer() {
+  if (!currentRoom || !myPlayer) return;
+  if (myPlayer.status !== 'out') return;
+
+  await supabaseClient.from('room_players').update({
+    chips: currentRoom.starting_chips,
+    status: 'waiting',
+    is_connected: true
+  }).eq('id', myPlayerId).eq('room_id', currentRoom.id);
+
+  await logAction(currentRoom.id, myPlayerId, myPlayer.name, `rebuys ($${currentRoom.starting_chips})`, currentRoom.starting_chips);
+  showToast(`Rebuy successful: $${currentRoom.starting_chips}`, 'success');
 }
 
 // ─── UI Helpers ───────────────────────────────────────────────────
@@ -1775,7 +2248,10 @@ async function enterGame(roomId) {
     localStorage.setItem('poker_last_name', myPlayer.name);
   }
   const { data: gsData } = await supabaseClient.from('game_state').select('*').eq('room_id', roomId).single();
-  if (gsData) gameState = gsData.state;
+  if (gsData) {
+    gameState = gsData.state;
+    gameStateUpdatedAt = gsData.updated_at || null;
+  }
 
   // Subscribe to realtime
   subscribeToRoom(roomId);
@@ -1790,6 +2266,7 @@ async function enterGame(roomId) {
   }
 
   startRoomExpiryCheck();
+  startRoundAdvanceWatcher();
   renderGame();
   hideLoading();
 }
@@ -1914,6 +2391,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Show/Muck buttons
   document.getElementById('btn-show-hand')?.addEventListener('click', () => playerReveal(true));
   document.getElementById('btn-muck-hand')?.addEventListener('click', () => playerReveal(false));
+  document.getElementById('btn-rebuy')?.addEventListener('click', () => rebuyMyPlayer());
 
   // Hand rankings modal
   document.getElementById('btn-rankings')?.addEventListener('click', () => {

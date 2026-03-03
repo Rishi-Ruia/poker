@@ -131,10 +131,20 @@ function compareScores(a, b) {
 // Determine winners from a set of players with their hands + community cards
 function determineWinners(players, communityCards) {
   // players: [{ id, cards: [card1, card2] }, ...]
-  const evaluations = players.map(p => ({
-    id: p.id,
-    eval: evaluateHand([...p.cards, ...communityCards])
-  }));
+  if (!players || players.length === 0) {
+    return { winners: [], evaluations: [] };
+  }
+
+  const evaluations = players
+    .map(p => ({
+      id: p.id,
+      eval: evaluateHand([...p.cards, ...communityCards])
+    }))
+    .filter(e => e.eval && Array.isArray(e.eval.score));
+
+  if (evaluations.length === 0) {
+    return { winners: [], evaluations: [] };
+  }
 
   let best = null;
   for (const e of evaluations) {

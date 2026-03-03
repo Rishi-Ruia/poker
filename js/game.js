@@ -836,6 +836,7 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
     phase: 'showdown',
     winners: paidWinnerIds,
     evaluations,
+    winnings_by_player_id: winningsById,
     round_done: true,
     round_done_at: new Date().toISOString(),
     next_hand_at: new Date(Date.now() + 5000).toISOString(),
@@ -1385,6 +1386,7 @@ function renderGame() {
   patchSidebarPlayers();
   renderActionPanel();
   renderPhase();
+  checkAndShowWinner();
 }
 
 function patchTurnIndicator() {
@@ -1550,7 +1552,16 @@ function patchCommunityCards() {
   if (isNewRound) {
     _prevCommunityCards = [];
     _prevRound = gameState.round_number;
+    _shownWinner = null;
   }
+
+  const newlyRevealedIndexes = [];
+  for (let i = 0; i < cards.length; i++) {
+    if (_prevCommunityCards[i] !== cards[i]) newlyRevealedIndexes.push(i);
+  }
+  const revealDelayByIndex = new Map(
+    newlyRevealedIndexes.map((cardIdx, revealOrder) => [cardIdx, revealOrder * 170])
+  );
 
   for (let i = 0; i < 5; i++) {
     let el = document.getElementById(`cc-${i}`);
@@ -1567,6 +1578,7 @@ function patchCommunityCards() {
       if (el.className !== 'community-card placeholder') {
         el.className = 'community-card placeholder';
         el.innerHTML = '';
+        el.style.animationDelay = '0ms';
         _prevCommunityCards[i] = null;
       }
       continue;
@@ -1578,7 +1590,9 @@ function patchCommunityCards() {
 
     const { rank, suit, suitCode } = cardDisplay(cards[i]);
     const isRed = suitCode === 'h' || suitCode === 'd';
+    const revealDelayMs = revealDelayByIndex.get(i) || 0;
     el.className = `community-card ${isRed ? 'red' : 'black'} card-flip-in`;
+    el.style.animationDelay = `${revealDelayMs}ms`;
     el.innerHTML = `
       <div class="card-rank">${rank}</div>
       <div class="card-suit">${suit}</div>
@@ -1586,7 +1600,10 @@ function patchCommunityCards() {
     `;
     // Remove animation class after it completes so re-renders don't re-trigger it
     const captured = el;
-    setTimeout(() => captured.classList.remove('card-flip-in'), 600);
+    setTimeout(() => {
+      captured.classList.remove('card-flip-in');
+      captured.style.animationDelay = '0ms';
+    }, 650 + revealDelayMs);
   }
 }
 
@@ -1939,14 +1956,57 @@ function showPhaseBanner(text) {
 }
 
 function checkAndShowWinner() {
-  return;
+  if (!gameState?.round_done) return;
+  const winners = gameState.winners || [];
+  if (!winners.length) return;
+
+  const winnerKey = `${gameState.round_number || 0}|${(winners || []).join(',')}|${gameState.round_done_at || ''}`;
+  if (_shownWinner === winnerKey) return;
+  _shownWinner = winnerKey;
+
+  showWinnerOverlay(
+    winners,
+    gameState.evaluations || [],
+    Number(gameState.pot || 0),
+    gameState.community_cards || [],
+    gameState.hands || {},
+    gameState.winnings_by_player_id || {},
+    gameState.player_contributions || {}
+  );
 }
 
-function showWinnerOverlay(winners, evaluations, pot, communityCards, hands) {
+function showWinnerOverlay(winners, evaluations, pot, communityCards, hands, winningsByPlayerId = {}, contributions = {}) {
   const overlay = document.getElementById('winner-overlay');
   if (!overlay) return;
 
   const winnerPlayers = winners.map(id => allPlayers.find(p => p.id === id)).filter(Boolean);
+  const evalById = new Map((evaluations || []).map(ev => [ev.id, ev]));
+
+  function formatCards(cards = []) {
+    return (cards || []).map(card => {
+      if (!card) return '';
+      const { rank, suit } = cardDisplay(card);
+      return `${rank}${suit}`;
+    }).filter(Boolean).join(' ');
+  }
+
+  const winnerReasons = winnerPlayers.map(player => {
+    const ev = evalById.get(player.id);
+    if (!ev?.hand?.name) return `${player.name}`;
+    return `${player.name} — ${ev.hand.name}`;
+  });
+
+  const reasonText = winnerReasons.length
+    ? (winnerReasons.length === 1
+      ? `Winning hand: ${winnerReasons[0].split(' — ')[1] || winnerReasons[0]}`
+      : `Winning hands: ${winnerReasons.join(' · ')}`)
+    : 'Winner determined by remaining hand.';
+
+  const sidePots = calculateSidePotsFromContributions(contributions);
+  const hasSidePots = sidePots.length > 1;
+  const sidePotText = hasSidePots
+    ? `Pot structure: Main Pot + ${sidePots.length - 1} Side Pot${sidePots.length - 1 > 1 ? 's' : ''}`
+    : '';
 
   let handsHtml = '';
   if (evaluations?.length) {
@@ -1954,23 +2014,37 @@ function showWinnerOverlay(winners, evaluations, pot, communityCards, hands) {
       const player = allPlayers.find(p => p.id === ev.id);
       if (!player) continue;
       const isWinner = winners.includes(ev.id);
+      const holeCards = formatCards(hands?.[ev.id] || []);
+      const bestFive = formatCards(ev.hand?.cards || []);
       handsHtml += `
         <div class="winner-hand-item">
           <div class="w-name">${isWinner ? '<span class="winner-crown">👑</span>' : ''}${escHtml(player.name)}</div>
           <div class="w-hand">${ev.hand?.name || ''}</div>
-          <div class="w-cards">${(hands?.[ev.id] || []).join(' ')}</div>
+          <div class="w-cards">Hole: ${holeCards || '—'}${bestFive ? ` · Best 5: ${bestFive}` : ''}</div>
         </div>
       `;
     }
   }
+
+  const totalWinnerPayout = winnerPlayers.reduce((sum, player) => {
+    return sum + Number(winningsByPlayerId?.[player.id] || 0);
+  }, 0);
+
+  const payoutText = totalWinnerPayout > 0
+    ? winnerPlayers
+      .map(player => `${escHtml(player.name)} +$${Number(winningsByPlayerId?.[player.id] || 0)}`)
+      .join(' · ')
+    : `+$${Math.floor(pot / Math.max(1, winners.length))} each`;
 
   overlay.innerHTML = `
     <div class="winner-box">
       <div class="winner-emoji">🏆</div>
       <div class="winner-title">${winnerPlayers.length > 1 ? 'Split Pot!' : 'Winner!'}</div>
       <div class="winner-name">${winnerPlayers.map(p => escHtml(p.name)).join(' & ')}</div>
+      <div class="winner-hand">${escHtml(reasonText)}</div>
+      ${sidePotText ? `<div class="winner-hand">${escHtml(sidePotText)}</div>` : ''}
       ${evaluations?.length ? `<div class="winner-hands-list">${handsHtml}</div>` : ''}
-      <div class="winner-pot">+$${Math.floor(pot / winners.length)}</div>
+      <div class="winner-pot">${payoutText}</div>
       <div style="color: var(--text-muted); font-size: 0.82rem;">Next hand starting in 5 seconds...</div>
     </div>
   `;

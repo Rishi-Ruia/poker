@@ -1380,6 +1380,37 @@ let _prevPot = -1;
 let _prevPhase = null;
 let _prevRound = -1;
 let _shownWinner = null;
+let _communityRevealVisibleCount = 0;
+let _communityRevealTargetCount = 0;
+let _communityRevealTimer = null;
+
+function clearCommunityRevealTimer() {
+  if (_communityRevealTimer) {
+    clearInterval(_communityRevealTimer);
+    _communityRevealTimer = null;
+  }
+}
+
+function getVisibleCommunityCards() {
+  const cards = gameState?.community_cards || [];
+  const visible = Math.min(_communityRevealVisibleCount, cards.length);
+  return cards.slice(0, visible);
+}
+
+function startCommunityRevealSequence() {
+  if (_communityRevealTimer) return;
+  _communityRevealTimer = setInterval(() => {
+    const cards = gameState?.community_cards || [];
+    const maxVisible = Math.min(_communityRevealTargetCount, cards.length);
+    if (_communityRevealVisibleCount < maxVisible) {
+      _communityRevealVisibleCount += 1;
+      patchCommunityCards();
+      patchMyHand();
+      return;
+    }
+    clearCommunityRevealTimer();
+  }, 360);
+}
 
 function getVisiblePlayers() {
   return allPlayers.filter(p => p.status !== 'out');
@@ -1564,14 +1595,41 @@ function patchCommunityCards() {
   const visibleSlots = Math.max(baseVisibleSlots, cards.length);
   const isNewRound = gameState.round_number !== _prevRound;
   if (isNewRound) {
+    clearCommunityRevealTimer();
+    // On first load in the middle of a hand, show board immediately.
+    const isFirstRender = _prevRound === -1;
+    _communityRevealVisibleCount = isFirstRender ? cards.length : 0;
+    _communityRevealTargetCount = cards.length;
     _prevCommunityCards = [];
     _prevRound = gameState.round_number;
     _shownWinner = null;
   }
 
+  if (!isNewRound && cards.length > _communityRevealTargetCount) {
+    const delta = cards.length - _communityRevealTargetCount;
+    _communityRevealTargetCount = cards.length;
+
+    if (delta > 1) {
+      // Flop: reveal one immediately, then drip remaining cards.
+      _communityRevealVisibleCount = Math.min(_communityRevealVisibleCount + 1, cards.length);
+      startCommunityRevealSequence();
+    } else {
+      _communityRevealVisibleCount = cards.length;
+      clearCommunityRevealTimer();
+    }
+  }
+
+  if (cards.length < _communityRevealVisibleCount) {
+    _communityRevealVisibleCount = cards.length;
+    _communityRevealTargetCount = cards.length;
+    clearCommunityRevealTimer();
+  }
+
+  const visibleCards = cards.slice(0, Math.min(_communityRevealVisibleCount, cards.length));
+
   const newlyRevealedIndexes = [];
-  for (let i = 0; i < cards.length; i++) {
-    if (_prevCommunityCards[i] !== cards[i]) newlyRevealedIndexes.push(i);
+  for (let i = 0; i < visibleCards.length; i++) {
+    if (_prevCommunityCards[i] !== visibleCards[i]) newlyRevealedIndexes.push(i);
   }
   const revealDelayByIndex = new Map(
     newlyRevealedIndexes.map((cardIdx, revealOrder) => [cardIdx, revealOrder * 170])
@@ -1588,7 +1646,7 @@ function patchCommunityCards() {
     el.style.display = i < visibleSlots ? '' : 'none';
     if (i >= visibleSlots) continue;
 
-    if (i >= cards.length) {
+    if (i >= visibleCards.length) {
       if (el.className !== 'community-card placeholder') {
         el.className = 'community-card placeholder';
         el.innerHTML = '';
@@ -1599,10 +1657,10 @@ function patchCommunityCards() {
     }
 
     // Card exists — only update if it's newly placed (or round reset)
-    if (_prevCommunityCards[i] === cards[i]) continue;
-    _prevCommunityCards[i] = cards[i];
+    if (_prevCommunityCards[i] === visibleCards[i]) continue;
+    _prevCommunityCards[i] = visibleCards[i];
 
-    const { rank, suit, suitCode } = cardDisplay(cards[i]);
+    const { rank, suit, suitCode } = cardDisplay(visibleCards[i]);
     const isRed = suitCode === 'h' || suitCode === 'd';
     const revealDelayMs = revealDelayByIndex.get(i) || 0;
     el.className = `community-card ${isRed ? 'red' : 'black'} card-flip-in`;
@@ -1680,7 +1738,7 @@ function patchMyHand() {
   }
 
   // Hand strength + highlight best-hand cards
-  const community = gameState.community_cards || [];
+  const community = getVisibleCommunityCards();
   if (handName) {
     if (community.length >= 3) {
       const ev = evaluateHand([...cards, ...community]);

@@ -332,6 +332,14 @@ function buildReopenedActingOrder(state, actingPlayerId) {
     : sorted;
 }
 
+function cloneGameState(state) {
+  if (!state) return state;
+  if (typeof structuredClone === 'function') {
+    return structuredClone(state);
+  }
+  return JSON.parse(JSON.stringify(state));
+}
+
 // ─── Player Actions ───────────────────────────────────────────────
 async function playerAction(action, amount = 0) {
   if (isProcessingAction) return;
@@ -343,7 +351,7 @@ async function playerAction(action, amount = 0) {
 
   isProcessingAction = true;
   try {
-    const state = { ...gameState };
+    const state = cloneGameState(gameState);
     const player = allPlayers.find(p => p.id === myPlayerId);
     if (!player) return;
 
@@ -515,9 +523,11 @@ async function processEndOfBettingRound(state) {
 }
 
 async function advanceToFlop(state, newPlayerBets) {
-  const flop = [state.deck.pop(), state.deck.pop(), state.deck.pop()];
+  const deck = [...(state.deck || [])];
+  const flop = [deck.pop(), deck.pop(), deck.pop()];
   const newState = {
     ...state,
+    deck,
     phase: 'flop',
     community_cards: flop,
     current_bet: 0,
@@ -532,9 +542,11 @@ async function advanceToFlop(state, newPlayerBets) {
 }
 
 async function advanceToTurn(state, newPlayerBets) {
-  const turn = state.deck.pop();
+  const deck = [...(state.deck || [])];
+  const turn = deck.pop();
   const newState = {
     ...state,
+    deck,
     phase: 'turn',
     community_cards: [...state.community_cards, turn],
     current_bet: 0,
@@ -549,9 +561,11 @@ async function advanceToTurn(state, newPlayerBets) {
 }
 
 async function advanceToRiver(state, newPlayerBets) {
-  const river = state.deck.pop();
+  const deck = [...(state.deck || [])];
+  const river = deck.pop();
   const newState = {
     ...state,
+    deck,
     phase: 'river',
     community_cards: [...state.community_cards, river],
     current_bet: 0,

@@ -20,7 +20,7 @@ let _roundAdvanceInterval = null;
 let _turnTimeoutInFlight = false;
 let _lastTurnTimeoutAttemptAt = 0;
 
-const TURN_ACTION_SECONDS = 10;
+const TURN_ACTION_SECONDS = 15;
 
 // ─── Init ─────────────────────────────────────────────────────────
 function initSupabase() {
@@ -906,8 +906,36 @@ async function advanceRoundAfterPayout(lockedState) {
     return;
   }
 
+  const gameWinner = eligible[0] || null;
+  const finalState = {
+    ...lockedState,
+    game_over: true,
+    game_winner_id: gameWinner?.id || null,
+    game_winner_name: gameWinner?.name || null,
+    game_winner_chips: Number(gameWinner?.chips || 0),
+    game_finished_at: new Date().toISOString(),
+    current_player_id: null,
+    action_turn_player_id: null,
+    action_deadline_at: null,
+    timeout_action_lock: null,
+    round_transition_lock: null
+  };
+  const finalUpdatedAt = new Date().toISOString();
+  await supabaseClient
+    .from('game_state')
+    .update({ state: finalState, updated_at: finalUpdatedAt })
+    .eq('room_id', currentRoom.id);
+  gameState = finalState;
+  gameStateUpdatedAt = finalUpdatedAt;
+
   await supabaseClient.from('rooms').update({ status: 'finished' }).eq('id', currentRoom.id);
-  await logAction(currentRoom.id, 'system', 'Dealer', 'Game over!', 0);
+  await logAction(
+    currentRoom.id,
+    'system',
+    'Dealer',
+    gameWinner ? `Game over! ${gameWinner.name} wins the table.` : 'Game over!',
+    0
+  );
 }
 
 async function maybeAdvanceRoundAfterPayout() {
@@ -1380,6 +1408,7 @@ let _prevPot = -1;
 let _prevPhase = null;
 let _prevRound = -1;
 let _shownWinner = null;
+let _shownGameWinner = null;
 let _communityRevealVisibleCount = 0;
 let _communityRevealTargetCount = 0;
 let _communityRevealTimer = null;
@@ -1432,6 +1461,7 @@ function renderGame() {
   renderActionPanel();
   renderPhase();
   checkAndShowWinner();
+  checkAndShowGameWinner();
 }
 
 function patchTurnIndicator() {
@@ -1459,7 +1489,7 @@ function patchTurnIndicator() {
   const isMe = actingPlayer.id === myPlayerId;
   const deadlineMs = getActionDeadlineMs(gameState);
   const secondsLeft = deadlineMs
-    ? Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000))
+    ? Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1500))
     : TURN_ACTION_SECONDS;
   el.style.display = '';
   el.textContent = isMe
@@ -1901,6 +1931,17 @@ function renderActionPanel() {
     return;
   }
 
+  if (currentRoom?.status === 'finished' || gameState.game_over) {
+    panel.classList.remove('visible');
+    hideAllButtons();
+    const winnerName = gameState.game_winner_name;
+    statusText.textContent = winnerName
+      ? `${winnerName} wins the game!`
+      : 'Game finished.';
+    statusText.className = 'game-status-text highlight';
+    return;
+  }
+
   // Showdown ordered show/muck phase
   if (gameState.phase === 'showdown' && gameState.showdown_needed && !gameState.round_done) {
     const needed = gameState.showdown_needed || [];
@@ -2045,6 +2086,40 @@ function checkAndShowWinner() {
     gameState.winnings_by_player_id || {},
     gameState.player_contributions || {}
   );
+}
+
+function checkAndShowGameWinner() {
+  if (!(currentRoom?.status === 'finished' || gameState?.game_over)) return;
+
+  const winnerId = gameState?.game_winner_id || null;
+  const winnerName = gameState?.game_winner_name || allPlayers.find(p => p.id === winnerId)?.name || null;
+  const winnerChips = Number(gameState?.game_winner_chips || allPlayers.find(p => p.id === winnerId)?.chips || 0);
+  const key = `${currentRoom?.id || ''}|${winnerId || 'none'}|${gameState?.game_finished_at || ''}`;
+  if (_shownGameWinner === key) return;
+  _shownGameWinner = key;
+
+  showGameWinnerOverlay(winnerName, winnerChips);
+}
+
+function showGameWinnerOverlay(winnerName, winnerChips) {
+  const overlay = document.getElementById('winner-overlay');
+  if (!overlay) return;
+
+  const title = winnerName ? `${winnerName} Wins The Game!` : 'Game Over';
+  const subtitle = winnerName
+    ? `Final stack: $${winnerChips.toLocaleString()}`
+    : 'No winner could be determined.';
+
+  overlay.innerHTML = `
+    <div class="winner-box">
+      <div class="winner-emoji">👑</div>
+      <div class="winner-title">Champion</div>
+      <div class="winner-name">${escHtml(title)}</div>
+      <div class="winner-hand">${escHtml(subtitle)}</div>
+      <div style="color: var(--text-muted); font-size: 0.82rem;">Create or join a new room to play again.</div>
+    </div>
+  `;
+  overlay.classList.add('visible');
 }
 
 function showWinnerOverlay(winners, evaluations, pot, communityCards, hands, winningsByPlayerId = {}, contributions = {}) {

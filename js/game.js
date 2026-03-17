@@ -19,8 +19,11 @@ let _lastRoundAdvanceAttemptAt = 0;
 let _roundAdvanceInterval = null;
 let _turnTimeoutInFlight = false;
 let _lastTurnTimeoutAttemptAt = 0;
+let _unavailableTurnInFlight = false;
+let _lastUnavailableTurnAttemptAt = 0;
 
 const TURN_ACTION_SECONDS = 15;
+const BETWEEN_HAND_DELAY_MS = 15000;
 
 // ─── Init ─────────────────────────────────────────────────────────
 function initSupabase() {
@@ -642,9 +645,10 @@ async function playerReveal(show) {
   const currentShowdownPlayerId = gameState.showdown_current_player_id || needed.find(id => decisions[id] === undefined) || null;
 
   if (!needed.includes(myPlayerId)) {
-    // Optional reveal for folded players
+    // Optional reveal for folded players in showdown OR winners after round is done
     const player = allPlayers.find(p => p.id === myPlayerId);
-    if (player?.status !== 'folded') return;
+    const isWinnerPostRound = !!gameState.round_done && (gameState.winners || []).includes(myPlayerId);
+    if (!isWinnerPostRound && player?.status !== 'folded') return;
     const optReveals = { ...(gameState.optional_reveals || {}), [myPlayerId]: show };
     const newState = { ...gameState, optional_reveals: optReveals };
     await supabaseClient.from('game_state').update({ state: newState, updated_at: new Date().toISOString() }).eq('room_id', currentRoom.id);
@@ -853,7 +857,7 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
     winnings_by_player_id: winningsById,
     round_done: true,
     round_done_at: new Date().toISOString(),
-    next_hand_at: new Date(Date.now() + 5000).toISOString(),
+    next_hand_at: new Date(Date.now() + BETWEEN_HAND_DELAY_MS).toISOString(),
     round_transition_lock: null,
     action_turn_player_id: null,
     action_deadline_at: null,
@@ -873,7 +877,7 @@ function getNextHandAtMs(state, fallbackUpdatedAt) {
   if (Number.isFinite(explicitMs)) return explicitMs;
 
   const baseMs = Date.parse(state?.round_done_at || fallbackUpdatedAt || '');
-  return Number.isFinite(baseMs) ? baseMs + 5000 : Date.now() + 5000;
+  return Number.isFinite(baseMs) ? baseMs + BETWEEN_HAND_DELAY_MS : Date.now() + BETWEEN_HAND_DELAY_MS;
 }
 
 async function advanceRoundAfterPayout(lockedState) {
@@ -1086,9 +1090,111 @@ async function maybeProcessTurnTimeout() {
   }
 }
 
+async function processUnavailableCurrentTurn(lockedState, unavailablePlayerId) {
+  if (!unavailablePlayerId || lockedState.current_player_id !== unavailablePlayerId) return;
+
+  const player = allPlayers.find(p => p.id === unavailablePlayerId);
+  const playerName = player?.name || unavailablePlayerId;
+
+  const newState = {
+    ...lockedState,
+    player_bets: { ...(lockedState.player_bets || {}) },
+    player_contributions: { ...(lockedState.player_contributions || {}) },
+    acting_order: (lockedState.acting_order || []).filter(id => id !== unavailablePlayerId),
+    all_in_players: (lockedState.all_in_players || []).filter(id => id !== unavailablePlayerId),
+    active_player_ids: (lockedState.active_player_ids || []).filter(id => id !== unavailablePlayerId),
+    timeout_action_lock: null,
+    action_turn_player_id: null,
+    action_deadline_at: null
+  };
+
+  await logAction(currentRoom.id, unavailablePlayerId, playerName, 'folds (left table)', 0);
+
+  const contenders = getHandContenders(newState);
+  if (contenders.length <= 1) {
+    await processEndOfBettingRound(newState);
+    return;
+  }
+
+  const eligibleToAct = new Set(
+    (newState.active_player_ids || []).filter(id => !(newState.all_in_players || []).includes(id))
+  );
+  const stillToAct = (newState.acting_order || []).filter(id => eligibleToAct.has(id));
+
+  if ((newState.active_player_ids || []).filter(id => !(newState.all_in_players || []).includes(id)).length <= 1 &&
+      stillToAct.length === 0) {
+    await processEndOfBettingRound(newState);
+    return;
+  }
+
+  if (stillToAct.length === 0) {
+    await processEndOfBettingRound(newState);
+    return;
+  }
+
+  newState.current_player_id = stillToAct[0];
+  const timedState = applyTurnDeadline(newState, newState.current_player_id);
+  const updatedAt = new Date().toISOString();
+  await supabaseClient.from('game_state').update({ state: timedState, updated_at: updatedAt }).eq('room_id', currentRoom.id);
+  gameStateUpdatedAt = updatedAt;
+}
+
+async function maybeProcessUnavailableCurrentTurn() {
+  if (!currentRoom || currentRoom.status !== 'playing' || !gameState) return;
+  if (_unavailableTurnInFlight || isProcessingAction) return;
+  if (gameState.round_done || gameState.phase === 'waiting' || gameState.phase === 'showdown') return;
+
+  const turnPlayerId = gameState.current_player_id;
+  if (!turnPlayerId) return;
+
+  const turnPlayer = allPlayers.find(p => p.id === turnPlayerId);
+  const hasLeftTable = !turnPlayer || turnPlayer.status === 'out';
+  if (!hasLeftTable) return;
+
+  const now = Date.now();
+  if (now - _lastUnavailableTurnAttemptAt < 800) return;
+  _lastUnavailableTurnAttemptAt = now;
+
+  const expectedUpdatedAt = gameStateUpdatedAt;
+  if (!expectedUpdatedAt) return;
+
+  _unavailableTurnInFlight = true;
+  try {
+    const lockState = {
+      ...gameState,
+      timeout_action_lock: {
+        by: myPlayerId,
+        at: new Date().toISOString(),
+        for_player_id: turnPlayerId,
+        reason: 'left_table'
+      }
+    };
+    const lockUpdatedAt = new Date().toISOString();
+
+    const { data: lockRow, error: lockErr } = await supabaseClient
+      .from('game_state')
+      .update({ state: lockState, updated_at: lockUpdatedAt })
+      .eq('room_id', currentRoom.id)
+      .eq('updated_at', expectedUpdatedAt)
+      .select('state, updated_at')
+      .maybeSingle();
+
+    if (lockErr || !lockRow) return;
+
+    gameState = lockRow.state || gameState;
+    gameStateUpdatedAt = lockRow.updated_at;
+    await processUnavailableCurrentTurn(lockRow.state || lockState, turnPlayerId);
+  } catch (e) {
+    console.error('Unavailable turn processing failed:', e);
+  } finally {
+    _unavailableTurnInFlight = false;
+  }
+}
+
 function startRoundAdvanceWatcher() {
   if (_roundAdvanceInterval) clearInterval(_roundAdvanceInterval);
   _roundAdvanceInterval = setInterval(() => {
+    maybeProcessUnavailableCurrentTurn();
     maybeProcessTurnTimeout();
     maybeAdvanceRoundAfterPayout();
     patchTurnIndicator();
@@ -1347,6 +1453,7 @@ function subscribeToRoom(roomId) {
       gameStateUpdatedAt = payload.new?.updated_at || null;
       await refreshPlayers();
       renderGame();
+      await maybeProcessUnavailableCurrentTurn();
       await maybeProcessTurnTimeout();
       await maybeAdvanceRoundAfterPayout();
     })
@@ -1564,7 +1671,7 @@ function patchSeat(el, seatIdx) {
     const showFaceUp = isMe ||
       (gameState.phase === 'showdown' && !isFolded && decisions[player.id] === true) ||
       (gameState.phase === 'showdown' && isFolded && optReveals[player.id] === true) ||
-      (gameState.round_done && !isFolded && decisions[player.id] === true);
+      (gameState.round_done && !isFolded && (decisions[player.id] === true || optReveals[player.id] === true));
     const playerCards = gameState.hands[player.id];
     if (isFolded) {
       cardsHtml = `<div class="folded-text">Folded</div>`;
@@ -1967,9 +2074,37 @@ function renderActionPanel() {
   }
 
   if (gameState.round_done) {
-    panel.classList.remove('visible');
-    statusText.textContent = 'Next hand starting...';
-    statusText.className = 'game-status-text highlight';
+    const winners = gameState.winners || [];
+    const winnerNames = winners
+      .map(id => allPlayers.find(p => p.id === id)?.name)
+      .filter(Boolean);
+    const evalById = new Map((gameState.evaluations || []).map(ev => [ev.id, ev]));
+    const winnerHands = winners
+      .map(id => evalById.get(id)?.hand?.name)
+      .filter(Boolean);
+    const splitText = winners.length > 1 ? 'split the pot' : 'wins the pot';
+    const baseText = winnerNames.length
+      ? `${winnerNames.join(' & ')} ${splitText}`
+      : 'Hand complete';
+    const handText = winnerHands.length ? ` with ${winnerHands.join(' / ')}` : '';
+    const nextHandAtMs = getNextHandAtMs(gameState, gameStateUpdatedAt);
+    const secsLeft = Math.max(0, Math.ceil((nextHandAtMs - Date.now()) / 1000));
+    const nextHandText = secsLeft > 0
+      ? ` Next hand in ${secsLeft}s...`
+      : ' Next hand starting...';
+
+    const canWinnerReveal = winners.includes(myPlayerId) && !!gameState.hands?.[myPlayerId];
+    if (canWinnerReveal) {
+      panel.classList.add('visible');
+      showShowdownButtons('Show Hand', false);
+      statusText.textContent = `${baseText}${handText}.${nextHandText}`;
+      statusText.className = 'game-status-text highlight';
+    } else {
+      panel.classList.remove('visible');
+      hideAllButtons();
+      statusText.textContent = `${baseText}${handText}.${nextHandText}`;
+      statusText.className = 'game-status-text highlight';
+    }
     return;
   }
 
@@ -2076,128 +2211,15 @@ function checkAndShowWinner() {
   const winnerKey = `${gameState.round_number || 0}|${(winners || []).join(',')}|${gameState.round_done_at || ''}`;
   if (_shownWinner === winnerKey) return;
   _shownWinner = winnerKey;
-
-  showWinnerOverlay(
-    winners,
-    gameState.evaluations || [],
-    Number(gameState.pot || 0),
-    gameState.community_cards || [],
-    gameState.hands || {},
-    gameState.winnings_by_player_id || {},
-    gameState.player_contributions || {}
-  );
 }
 
 function checkAndShowGameWinner() {
   if (!(currentRoom?.status === 'finished' || gameState?.game_over)) return;
 
   const winnerId = gameState?.game_winner_id || null;
-  const winnerName = gameState?.game_winner_name || allPlayers.find(p => p.id === winnerId)?.name || null;
-  const winnerChips = Number(gameState?.game_winner_chips || allPlayers.find(p => p.id === winnerId)?.chips || 0);
   const key = `${currentRoom?.id || ''}|${winnerId || 'none'}|${gameState?.game_finished_at || ''}`;
   if (_shownGameWinner === key) return;
   _shownGameWinner = key;
-
-  showGameWinnerOverlay(winnerName, winnerChips);
-}
-
-function showGameWinnerOverlay(winnerName, winnerChips) {
-  const overlay = document.getElementById('winner-overlay');
-  if (!overlay) return;
-
-  const title = winnerName ? `${winnerName} Wins The Game!` : 'Game Over';
-  const subtitle = winnerName
-    ? `Final stack: $${winnerChips.toLocaleString()}`
-    : 'No winner could be determined.';
-
-  overlay.innerHTML = `
-    <div class="winner-box">
-      <div class="winner-emoji">👑</div>
-      <div class="winner-title">Champion</div>
-      <div class="winner-name">${escHtml(title)}</div>
-      <div class="winner-hand">${escHtml(subtitle)}</div>
-      <div style="color: var(--text-muted); font-size: 0.82rem;">Create or join a new room to play again.</div>
-    </div>
-  `;
-  overlay.classList.add('visible');
-}
-
-function showWinnerOverlay(winners, evaluations, pot, communityCards, hands, winningsByPlayerId = {}, contributions = {}) {
-  const overlay = document.getElementById('winner-overlay');
-  if (!overlay) return;
-
-  const winnerPlayers = winners.map(id => allPlayers.find(p => p.id === id)).filter(Boolean);
-  const evalById = new Map((evaluations || []).map(ev => [ev.id, ev]));
-
-  function formatCards(cards = []) {
-    return (cards || []).map(card => {
-      if (!card) return '';
-      const { rank, suit } = cardDisplay(card);
-      return `${rank}${suit}`;
-    }).filter(Boolean).join(' ');
-  }
-
-  const winnerReasons = winnerPlayers.map(player => {
-    const ev = evalById.get(player.id);
-    if (!ev?.hand?.name) return `${player.name}`;
-    return `${player.name} — ${ev.hand.name}`;
-  });
-
-  const reasonText = winnerReasons.length
-    ? (winnerReasons.length === 1
-      ? `Winning hand: ${winnerReasons[0].split(' — ')[1] || winnerReasons[0]}`
-      : `Winning hands: ${winnerReasons.join(' · ')}`)
-    : 'Winner determined by remaining hand.';
-
-  const sidePots = calculateSidePotsFromContributions(contributions);
-  const hasSidePots = sidePots.length > 1;
-  const sidePotText = hasSidePots
-    ? `Pot structure: Main Pot + ${sidePots.length - 1} Side Pot${sidePots.length - 1 > 1 ? 's' : ''}`
-    : '';
-
-  let handsHtml = '';
-  if (evaluations?.length) {
-    for (const ev of evaluations) {
-      const player = allPlayers.find(p => p.id === ev.id);
-      if (!player) continue;
-      const isWinner = winners.includes(ev.id);
-      const holeCards = formatCards(hands?.[ev.id] || []);
-      const bestFive = formatCards(ev.hand?.cards || []);
-      handsHtml += `
-        <div class="winner-hand-item">
-          <div class="w-name">${isWinner ? '<span class="winner-crown">👑</span>' : ''}${escHtml(player.name)}</div>
-          <div class="w-hand">${ev.hand?.name || ''}</div>
-          <div class="w-cards">Hole: ${holeCards || '—'}${bestFive ? ` · Best 5: ${bestFive}` : ''}</div>
-        </div>
-      `;
-    }
-  }
-
-  const totalWinnerPayout = winnerPlayers.reduce((sum, player) => {
-    return sum + Number(winningsByPlayerId?.[player.id] || 0);
-  }, 0);
-
-  const payoutText = totalWinnerPayout > 0
-    ? winnerPlayers
-      .map(player => `${escHtml(player.name)} +$${Number(winningsByPlayerId?.[player.id] || 0)}`)
-      .join(' · ')
-    : `+$${Math.floor(pot / Math.max(1, winners.length))} each`;
-
-  overlay.innerHTML = `
-    <div class="winner-box">
-      <div class="winner-emoji">🏆</div>
-      <div class="winner-title">${winnerPlayers.length > 1 ? 'Split Pot!' : 'Winner!'}</div>
-      <div class="winner-name">${winnerPlayers.map(p => escHtml(p.name)).join(' & ')}</div>
-      <div class="winner-hand">${escHtml(reasonText)}</div>
-      ${sidePotText ? `<div class="winner-hand">${escHtml(sidePotText)}</div>` : ''}
-      ${evaluations?.length ? `<div class="winner-hands-list">${handsHtml}</div>` : ''}
-      <div class="winner-pot">${payoutText}</div>
-      <div style="color: var(--text-muted); font-size: 0.82rem;">Next hand starting in 5 seconds...</div>
-    </div>
-  `;
-  overlay.classList.add('visible');
-
-  setTimeout(() => overlay.classList.remove('visible'), 5000);
 }
 
 // ─── Waiting Room ─────────────────────────────────────────────────

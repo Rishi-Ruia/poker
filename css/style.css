@@ -278,16 +278,17 @@ body { overflow-y: auto; }
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 80px 100px;
+  padding: clamp(28px, 8vh, 80px) clamp(14px, 6vw, 100px);
   position: relative;
   min-width: 0;
+  min-height: 0;
 }
 
 .poker-table {
   width: 100%;
-  max-width: 900px;
+  max-width: min(900px, 100%);
   aspect-ratio: 2 / 1;
-  max-height: calc(100vh - 340px);
+  max-height: min(62vh, calc(100dvh - 260px));
   background: var(--felt-gradient);
   border-radius: 50%;
   border: 12px solid #3d2d0a;
@@ -325,13 +326,13 @@ body { overflow-y: auto; }
 }
 
 /* Seat positions - oval layout */
-.seat-0 { bottom: -70px; left: 50%; transform: translateX(-50%); }
-.seat-1 { bottom: -30px; left: 8%; }
-.seat-2 { top: 35%; left: -90px; transform: translateY(-50%); }
-.seat-3 { top: -70px; left: 25%; }
-.seat-4 { top: -70px; right: 25%; }
-.seat-5 { top: 35%; right: -90px; transform: translateY(-50%); }
-.seat-6 { bottom: -30px; right: 8%; }
+.seat-0 { bottom: -15%; left: 50%; transform: translateX(-50%); }
+.seat-1 { bottom: -7%; left: 10%; }
+.seat-2 { top: 35%; left: -10%; transform: translateY(-50%); }
+.seat-3 { top: -15%; left: 26%; }
+.seat-4 { top: -15%; right: 26%; }
+.seat-5 { top: 35%; right: -10%; transform: translateY(-50%); }
+.seat-6 { bottom: -7%; right: 10%; }
 
 .player-avatar {
   width: 52px;
@@ -1089,14 +1090,30 @@ body { overflow-y: auto; }
   .table-area {
     flex: 1;
     min-height: 0;
-    padding: 75px 30px;
+    padding: clamp(44px, 10vh, 75px) 16px;
   }
 
   .poker-table {
     aspect-ratio: 1.4 / 1;
-    max-height: none;
+    max-height: min(52vh, calc(100dvh - 340px));
     width: 100%;
   }
+
+  .player-avatar {
+    width: 46px;
+    height: 46px;
+    font-size: 1.2rem;
+  }
+
+  .player-info {
+    min-width: 74px;
+    padding: 3px 8px;
+  }
+
+  .player-name { max-width: 78px; }
+
+  .seat-0 { bottom: -13%; }
+  .seat-2, .seat-5 { top: 37%; }
 
   .game-sidebar {
     display: flex;
@@ -1132,8 +1149,53 @@ body { overflow-y: auto; }
   /* More space for table on very small screens */
   .table-area { padding: 70px 16px; }
 
+  .poker-table {
+    aspect-ratio: 1.2 / 1;
+    max-height: min(48vh, calc(100dvh - 330px));
+  }
+
+  .player-avatar {
+    width: 42px;
+    height: 42px;
+    font-size: 1.05rem;
+  }
+
+  .player-info {
+    min-width: 66px;
+    padding: 2px 6px;
+  }
+
+  .player-name {
+    font-size: 0.68rem;
+    max-width: 70px;
+  }
+
+  .player-chips-display { font-size: 0.64rem; }
+
+  .seat-cards .pocket-card {
+    width: 22px;
+    height: 31px;
+    font-size: 0.5rem;
+  }
+
+  .seat-0 { bottom: -12%; }
+  .seat-1 { left: 8%; }
+  .seat-6 { right: 8%; }
+  .seat-2 { left: -8%; }
+  .seat-5 { right: -8%; }
+
   /* Slightly more sidebar room on phone */
   .game-sidebar { max-height: 48vh; }
+}
+
+@media (max-height: 760px) {
+  .table-area {
+    padding: 22px 16px;
+  }
+
+  .poker-table {
+    max-height: min(56vh, calc(100dvh - 220px));
+  }
 }
 
 /* Scrollbars */

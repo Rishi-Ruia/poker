@@ -21,6 +21,8 @@ let _turnTimeoutInFlight = false;
 let _lastTurnTimeoutAttemptAt = 0;
 let _unavailableTurnInFlight = false;
 let _lastUnavailableTurnAttemptAt = 0;
+let _turnRepairInFlight = false;
+let _lastTurnRepairAttemptAt = 0;
 
 const TURN_ACTION_SECONDS = 15;
 const BETWEEN_HAND_DELAY_MS = 15000;
@@ -179,6 +181,87 @@ function applyTurnDeadline(state, turnPlayerId = state?.current_player_id) {
 function getActionDeadlineMs(state) {
   const ts = Date.parse(state?.action_deadline_at || '');
   return Number.isFinite(ts) ? ts : null;
+}
+
+function isActionPhaseState(state) {
+  return !!state
+    && !state.round_done
+    && state.phase !== 'waiting'
+    && state.phase !== 'showdown';
+}
+
+function getEligibleActionPlayerIds(state) {
+  const active = state?.active_player_ids || [];
+  const allIn = new Set(state?.all_in_players || []);
+  return active.filter(id => !allIn.has(id));
+}
+
+function getPendingActionOrder(state) {
+  const eligible = new Set(getEligibleActionPlayerIds(state));
+  const pending = [];
+  const seen = new Set();
+  for (const id of (state?.acting_order || [])) {
+    if (!eligible.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    pending.push(id);
+  }
+  return pending;
+}
+
+function shouldRepairTurnState(state) {
+  if (!isActionPhaseState(state)) return false;
+  const pending = getPendingActionOrder(state);
+  if (!pending.length) return false;
+
+  const expectedPlayerId = pending[0];
+  const deadlineMs = getActionDeadlineMs(state);
+  return state.current_player_id !== expectedPlayerId
+    || state.action_turn_player_id !== expectedPlayerId
+    || !deadlineMs;
+}
+
+async function maybeRepairTurnState() {
+  if (!currentRoom || currentRoom.status !== 'playing' || !gameState) return;
+  if (_turnRepairInFlight || isProcessingAction || _turnTimeoutInFlight || _unavailableTurnInFlight) return;
+  if (!shouldRepairTurnState(gameState)) return;
+
+  const now = Date.now();
+  if (now - _lastTurnRepairAttemptAt < 600) return;
+  _lastTurnRepairAttemptAt = now;
+
+  const expectedUpdatedAt = gameStateUpdatedAt;
+  if (!expectedUpdatedAt) return;
+
+  const pending = getPendingActionOrder(gameState);
+  if (!pending.length) return;
+
+  _turnRepairInFlight = true;
+  try {
+    const nextPlayerId = pending[0];
+    const repairedState = applyTurnDeadline({
+      ...gameState,
+      acting_order: pending,
+      current_player_id: nextPlayerId,
+      timeout_action_lock: null
+    }, nextPlayerId);
+
+    const updatedAt = new Date().toISOString();
+    const { data: repairedRow, error: repairErr } = await supabaseClient
+      .from('game_state')
+      .update({ state: repairedState, updated_at: updatedAt })
+      .eq('room_id', currentRoom.id)
+      .eq('updated_at', expectedUpdatedAt)
+      .select('state, updated_at')
+      .maybeSingle();
+
+    if (repairErr || !repairedRow) return;
+    gameState = repairedRow.state || gameState;
+    gameStateUpdatedAt = repairedRow.updated_at;
+  } catch (e) {
+    console.error('Turn state repair failed:', e);
+  } finally {
+    _turnRepairInFlight = false;
+  }
 }
 
 async function fetchRooms() {
@@ -1194,6 +1277,7 @@ async function maybeProcessUnavailableCurrentTurn() {
 function startRoundAdvanceWatcher() {
   if (_roundAdvanceInterval) clearInterval(_roundAdvanceInterval);
   _roundAdvanceInterval = setInterval(() => {
+    maybeRepairTurnState();
     maybeProcessUnavailableCurrentTurn();
     maybeProcessTurnTimeout();
     maybeAdvanceRoundAfterPayout();
@@ -1453,6 +1537,7 @@ function subscribeToRoom(roomId) {
       gameStateUpdatedAt = payload.new?.updated_at || null;
       await refreshPlayers();
       renderGame();
+      await maybeRepairTurnState();
       await maybeProcessUnavailableCurrentTurn();
       await maybeProcessTurnTimeout();
       await maybeAdvanceRoundAfterPayout();
@@ -1596,7 +1681,7 @@ function patchTurnIndicator() {
   const isMe = actingPlayer.id === myPlayerId;
   const deadlineMs = getActionDeadlineMs(gameState);
   const secondsLeft = deadlineMs
-    ? Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1500))
+    ? Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000))
     : TURN_ACTION_SECONDS;
   el.style.display = '';
   el.textContent = isMe

@@ -25,7 +25,7 @@ let _turnRepairInFlight = false;
 let _lastTurnRepairAttemptAt = 0;
 
 const TURN_ACTION_SECONDS = 15;
-const BETWEEN_HAND_DELAY_MS = 15000;
+const BETWEEN_HAND_DELAY_MS = 5000;
 
 // ─── Init ─────────────────────────────────────────────────────────
 function initSupabase() {
@@ -155,7 +155,7 @@ function generateRoomCode() {
   return code;
 }
 
-function applyTurnDeadline(state, turnPlayerId = state?.current_player_id) {
+function applyTurnDeadline(state, turnPlayerId = state?.current_player_id, baselineMs = Date.now()) {
   const inActionPhase = !!state
     && !state.round_done
     && state.phase !== 'waiting'
@@ -173,7 +173,7 @@ function applyTurnDeadline(state, turnPlayerId = state?.current_player_id) {
   return {
     ...state,
     action_turn_player_id: turnPlayerId,
-    action_deadline_at: new Date(Date.now() + TURN_ACTION_SECONDS * 1000).toISOString(),
+    action_deadline_at: new Date(baselineMs + TURN_ACTION_SECONDS * 1000).toISOString(),
     timeout_action_lock: null
   };
 }
@@ -467,15 +467,18 @@ async function playerAction(action, amount = 0) {
 
       case 'call': {
         const callAmount = Math.min(state.current_bet - state.player_bets[myPlayerId], player.chips);
+        const nextChips = player.chips - callAmount;
         newState.pot = state.pot + callAmount;
         newState.player_bets[myPlayerId] = state.player_bets[myPlayerId] + callAmount;
         newState.player_contributions[myPlayerId] = (state.player_contributions[myPlayerId] || 0) + callAmount;
         betAmount = callAmount;
-        await supabaseClient.from('room_players').update({ chips: player.chips - callAmount }).eq('id', myPlayerId);
-        if (player.chips - callAmount === 0) {
+        await supabaseClient.from('room_players').update({
+          chips: nextChips,
+          status: nextChips === 0 ? 'all_in' : 'active'
+        }).eq('id', myPlayerId);
+        if (nextChips === 0) {
           if (!newState.all_in_players.includes(myPlayerId)) newState.all_in_players.push(myPlayerId);
           newState.active_player_ids = state.active_player_ids.filter(id => id !== myPlayerId);
-          await supabaseClient.from('room_players').update({ status: 'all_in' }).eq('id', myPlayerId);
         }
         await logAction(currentRoom.id, myPlayerId, player.name, 'calls', callAmount);
         break;
@@ -488,6 +491,7 @@ async function playerAction(action, amount = 0) {
           showToast('Not enough chips', 'error'); isProcessingAction = false; return;
         }
         const additional = totalRaise - state.player_bets[myPlayerId];
+        const nextChips = player.chips - additional;
         newState.pot = state.pot + additional;
         newState.current_bet = totalRaise;
         newState.player_bets[myPlayerId] = totalRaise;
@@ -498,11 +502,13 @@ async function playerAction(action, amount = 0) {
         // Rebuild acting order: all other active non-folded players need to act again
         newState.acting_order = buildReopenedActingOrder(newState, myPlayerId);
 
-        await supabaseClient.from('room_players').update({ chips: player.chips - additional }).eq('id', myPlayerId);
-        if (player.chips - additional === 0) {
+        await supabaseClient.from('room_players').update({
+          chips: nextChips,
+          status: nextChips === 0 ? 'all_in' : 'active'
+        }).eq('id', myPlayerId);
+        if (nextChips === 0) {
           if (!newState.all_in_players.includes(myPlayerId)) newState.all_in_players.push(myPlayerId);
           newState.active_player_ids = state.active_player_ids.filter(id => id !== myPlayerId);
-          await supabaseClient.from('room_players').update({ status: 'all_in' }).eq('id', myPlayerId);
           await logAction(currentRoom.id, myPlayerId, player.name, 'raises all-in', additional);
         } else {
           await logAction(currentRoom.id, myPlayerId, player.name, 'raises to', totalRaise);
@@ -840,14 +846,53 @@ function calculateSidePotsFromContributions(contributions = {}) {
   return pots;
 }
 
+function sumChipMap(valuesById = {}) {
+  return Object.values(valuesById).reduce((sum, value) => {
+    const amount = Number(value || 0);
+    return sum + (Number.isFinite(amount) && amount > 0 ? amount : 0);
+  }, 0);
+}
+
+function splitAmountAcrossPlayers(totalAmount, playerIds = []) {
+  const amount = Math.max(0, Math.floor(Number(totalAmount || 0)));
+  const targets = sortPlayerIdsBySeat([
+    ...new Set((playerIds || []).filter(Boolean))
+  ]);
+  const shares = {};
+
+  if (amount <= 0 || targets.length === 0) return shares;
+
+  const perPlayer = Math.floor(amount / targets.length);
+  let remainder = amount % targets.length;
+
+  for (const id of targets) {
+    const extra = remainder > 0 ? 1 : 0;
+    shares[id] = perPlayer + extra;
+    if (remainder > 0) remainder -= 1;
+  }
+
+  return shares;
+}
+
 async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
-  const pot = Number(state.pot || 0);
+  const pot = Math.max(0, Math.floor(Number(state.pot || 0)));
   const contributions = state.player_contributions || {};
+  const contributionPot = sumChipMap(contributions);
+  const effectivePot = contributionPot > 0 ? contributionPot : pot;
+
+  if (contributionPot > 0 && contributionPot !== pot) {
+    console.warn(`Payout pot mismatch detected. state.pot=${pot}, contributions=${contributionPot}`);
+  }
+
+  if (effectivePot <= 0) return;
+
   const evaluationIds = (evaluations || []).map(e => e.id);
-  const showdownEligibleIds = evaluationIds.length
-    ? [...new Set(evaluationIds)]
-    : [...new Set(winnerIds || [])];
+  const showdownEligibleSet = new Set(
+    evaluationIds.length ? evaluationIds : [...new Set(winnerIds || [])]
+  );
   const sortedWinnerIds = sortPlayerIdsBySeat([...(winnerIds || [])]);
+  const contenders = sortPlayerIdsBySeat(getHandContenders(state));
+  const contenderSet = new Set(contenders);
   const winningsById = {};
 
   function addWinnings(playerId, amount) {
@@ -859,11 +904,16 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
     const sidePots = calculateSidePotsFromContributions(contributions);
     const effectivePots = sidePots.length > 0
       ? sidePots
-      : [{ amount: pot, eligible: getHandContenders(state) }];
+      : [{ amount: effectivePot, eligible: contenders }];
 
     for (const sidePot of effectivePots) {
-      const eligible = sidePot.eligible.filter(id => showdownEligibleIds.includes(id));
-      if (!eligible.length) continue;
+      const eligibleContenders = sortPlayerIdsBySeat(
+        (sidePot.eligible || []).filter(id => contenderSet.has(id))
+      );
+      if (!eligibleContenders.length) continue;
+
+      const preferredEligible = eligibleContenders.filter(id => showdownEligibleSet.has(id));
+      const eligible = preferredEligible.length ? preferredEligible : eligibleContenders;
 
       let sideWinners = [];
       if (eligible.length === 1) {
@@ -885,30 +935,72 @@ async function awardPot(state, winnerIds, isShowdown, evaluations = []) {
         }
       }
 
-      const perWinner = Math.floor(sidePot.amount / sideWinners.length);
-      const remainder = sidePot.amount % sideWinners.length;
-      sideWinners.forEach((id, idx) => addWinnings(id, perWinner + (idx === 0 ? remainder : 0)));
+      const shares = splitAmountAcrossPlayers(sidePot.amount, sideWinners);
+      for (const [playerId, amount] of Object.entries(shares)) {
+        addWinnings(playerId, amount);
+      }
     }
   } else {
     const directWinners = sortedWinnerIds.length
       ? sortedWinnerIds
-      : sortPlayerIdsBySeat(getHandContenders(state)).slice(0, 1);
+      : contenders.slice(0, 1);
 
-    const perWinner = directWinners.length ? Math.floor(pot / directWinners.length) : 0;
-    const remainder = directWinners.length ? pot % directWinners.length : pot;
-    directWinners.forEach((id, idx) => addWinnings(id, perWinner + (idx === 0 ? remainder : 0)));
+    const shares = splitAmountAcrossPlayers(effectivePot, directWinners);
+    for (const [playerId, amount] of Object.entries(shares)) {
+      addWinnings(playerId, amount);
+    }
   }
 
-  const distributed = Object.values(winningsById).reduce((sum, val) => sum + val, 0);
-  if (distributed < pot) {
-    const fallbackId = sortPlayerIdsBySeat([
-      ...new Set([
-        ...(sortedWinnerIds || []),
-        ...showdownEligibleIds,
-        ...getHandContenders(state)
-      ])
-    ])[0];
-    addWinnings(fallbackId, pot - distributed);
+  let distributed = sumChipMap(winningsById);
+  if (distributed < effectivePot) {
+    const shortfall = effectivePot - distributed;
+    const fallbackTargets = sortPlayerIdsBySeat([
+      ...new Set(
+        Object.keys(winningsById).length
+          ? Object.keys(winningsById)
+          : (
+            sortedWinnerIds.length
+              ? sortedWinnerIds
+              : (
+                contenders.length
+                  ? contenders
+                  : (
+                    Object.keys(contributions).length
+                      ? Object.keys(contributions)
+                      : allPlayers.map(p => p.id)
+                  )
+              )
+          )
+      )
+    ]);
+
+    const reconciliation = splitAmountAcrossPlayers(shortfall, fallbackTargets);
+    for (const [playerId, amount] of Object.entries(reconciliation)) {
+      addWinnings(playerId, amount);
+    }
+
+    distributed = sumChipMap(winningsById);
+  }
+
+  if (distributed > effectivePot) {
+    let overflow = distributed - effectivePot;
+    const trimOrder = sortPlayerIdsBySeat(Object.keys(winningsById)).reverse();
+
+    for (const playerId of trimOrder) {
+      if (overflow <= 0) break;
+      const current = winningsById[playerId] || 0;
+      const trim = Math.min(current, overflow);
+      winningsById[playerId] = current - trim;
+      overflow -= trim;
+      if (winningsById[playerId] <= 0) delete winningsById[playerId];
+    }
+
+    distributed = sumChipMap(winningsById);
+  }
+
+  if (distributed !== effectivePot) {
+    console.error(`Failed to reconcile pot distribution. expected=${effectivePot}, distributed=${distributed}`);
+    return;
   }
 
   const paidWinnerIds = Object.keys(winningsById).filter(id => winningsById[id] > 0);
@@ -1282,6 +1374,7 @@ function startRoundAdvanceWatcher() {
     maybeProcessTurnTimeout();
     maybeAdvanceRoundAfterPayout();
     patchTurnIndicator();
+    renderActionPanel();
   }, 1000);
 }
 
@@ -1537,10 +1630,6 @@ function subscribeToRoom(roomId) {
       gameStateUpdatedAt = payload.new?.updated_at || null;
       await refreshPlayers();
       renderGame();
-      await maybeRepairTurnState();
-      await maybeProcessUnavailableCurrentTurn();
-      await maybeProcessTurnTimeout();
-      await maybeAdvanceRoundAfterPayout();
     })
     .subscribe();
 
@@ -1640,9 +1729,6 @@ function getVisiblePlayers() {
 function renderGame() {
   if (!gameState || !allPlayers.length) return;
   _rnd++;
-
-  maybeProcessTurnTimeout();
-  maybeAdvanceRoundAfterPayout();
 
   patchTableSeats();
   patchTurnIndicator();
